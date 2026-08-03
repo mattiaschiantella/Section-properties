@@ -9,6 +9,8 @@ from compute import (
 
 app = dash.Dash(__name__)
 app.title = "Section Analyzer"
+server = app.server  
+
 
 INPUT_STYLE = {"width": "90px", "marginRight": "8px"}
 BTN_STYLE = {"marginRight": "8px", "marginTop": "6px"}
