@@ -1,3 +1,7 @@
+import threading
+import time
+import os
+import requests
 import dash
 from dash import dcc, html, Input, Output, State, no_update
 from dash.exceptions import PreventUpdate
@@ -12,9 +16,37 @@ app = dash.Dash(__name__)
 app.title = "Section Analyzer"
 server = app.server  # needed by gunicorn/Render: exposes the underlying Flask app
 
+# =====================================================================
+# KEEP-ALIVE SELF-PING THREAD
+# Prevents Render free instances from sleeping due to 15-minute inactivity.
+# =====================================================================
+def keep_alive():
+    """Periodically pings the application endpoint to keep the Render service awake."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "https://section-properties-d6ej.onrender.com/")
+    
+    print(f"[Keep-Alive] Thread started for URL: {url}")
+    
+    # Initial delay before starting the ping loop
+    time.sleep(30)
+    
+    while True:
+        try:
+            response = requests.get(url, timeout=10)
+            print(f"[Keep-Alive] Ping sent to {url} - Status Code: {response.status_code}")
+        except Exception as e:
+            print(f"[Keep-Alive] Ping failed: {e}")
+        
+        # Ping every 10 minutes (600 seconds)
+        time.sleep(600)
+
+
+# Start the background thread in daemon mode
+ping_thread = threading.Thread(target=keep_alive, daemon=True)
+ping_thread.start()
+
+
 INPUT_STYLE = {"width": "90px", "marginRight": "8px"}
 BTN_STYLE = {"marginRight": "8px", "marginTop": "6px"}
-
 
 # =====================================================================
 # LAYOUT
