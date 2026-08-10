@@ -134,6 +134,91 @@ def compute_stress_extremes(rectangles, Mx, My, N, geom):
 
 
 # =====================================================================
+# SHEAR STRESSES (approximate Jourawski / Zhuravskii method)
+#
+# Classical assumption: at a given cut, the shear stress is uniform
+# across the width (horizontal cut) or height (vertical cut) of the
+# cut, i.e. tau = V * S / (I * b). Vy and Vx are treated independently
+# (horizontal cuts for Vy using Ix, vertical cuts for Vx using Iy) and
+# combined as a vector magnitude when both are present. This is an
+# engineering approximation, not a rigorous 2D coupled treatment.
+# =====================================================================
+
+def _width_at_y(rectangles, y):
+    """Total material width at height y (sum over all rectangles whose
+    y-range contains y -- handles disjoint pieces, e.g. flanges)."""
+    w = 0.0
+    for x0, y0, b, h in rectangles:
+        if y0 <= y <= y0 + h:
+            w += b
+    return w
+
+
+def _height_at_x(rectangles, x):
+    """Total material height at position x (sum over all rectangles
+    whose x-range contains x)."""
+    h_tot = 0.0
+    for x0, y0, b, h in rectangles:
+        if x0 <= x <= x0 + b:
+            h_tot += h
+    return h_tot
+
+
+def _Sx_below(rectangles, y, y_bar):
+    """First moment about the centroidal x-axis of the part of the
+    section with y' <= y (a horizontal cut at height y)."""
+    S = 0.0
+    for x0, y0, b, h in rectangles:
+        if y <= y0:
+            continue
+        y_bottom = min(y, y0 + h)
+        hh = y_bottom - y0
+        if hh <= 0:
+            continue
+        area = b * hh
+        yc = y0 + hh / 2
+        S += area * (yc - y_bar)
+    return S
+
+
+def _Sy_left(rectangles, x, x_bar):
+    """First moment about the centroidal y-axis of the part of the
+    section with x' <= x (a vertical cut at position x)."""
+    S = 0.0
+    for x0, y0, b, h in rectangles:
+        if x <= x0:
+            continue
+        x_right = min(x, x0 + b)
+        bb = x_right - x0
+        if bb <= 0:
+            continue
+        area = bb * h
+        xc = x0 + bb / 2
+        S += area * (xc - x_bar)
+    return S
+
+
+def tau_from_Vy(rectangles, y, Vy, geom):
+    """Shear stress at height y produced by a vertical shear force Vy
+    (horizontal cut, uniform-across-width assumption)."""
+    w = _width_at_y(rectangles, y)
+    if w <= 0:
+        return 0.0
+    S = _Sx_below(rectangles, y, geom["y_bar"])
+    return Vy * S / (geom["Ix"] * w)
+
+
+def tau_from_Vx(rectangles, x, Vx, geom):
+    """Shear stress at position x produced by a horizontal shear force
+    Vx (vertical cut, uniform-across-height assumption)."""
+    h_tot = _height_at_x(rectangles, x)
+    if h_tot <= 0:
+        return 0.0
+    S = _Sy_left(rectangles, x, geom["x_bar"])
+    return Vx * S / (geom["Iy"] * h_tot)
+
+
+# =====================================================================
 # PLOTLY HELPERS
 # =====================================================================
 
@@ -378,3 +463,86 @@ def build_stress_figure(rectangles, geom, Mx, My, N):
     )
 
     return fig, sigma_max, loc_max, sigma_min, loc_min
+
+
+def build_shear_figure(rectangles, geom, Vx, Vy):
+    """Approximate Jourawski shear stress map. Vx, Vy already in N."""
+    xs = [r[0] for r in rectangles]
+    ys = [r[1] for r in rectangles]
+    x1s = [r[0] + r[2] for r in rectangles]
+    y1s = [r[1] + r[3] for r in rectangles]
+    xmin, xmax = min(xs), max(x1s)
+    ymin, ymax = min(ys), max(y1s)
+
+    nx, ny = 220, 220
+    X = np.linspace(xmin, xmax, nx)
+    Y = np.linspace(ymin, ymax, ny)
+
+    # per-row / per-column profiles (each depends on a single coordinate)
+    tau_y_row = np.array([tau_from_Vy(rectangles, y, Vy, geom) for y in Y])  # (ny,)
+    tau_x_col = np.array([tau_from_Vx(rectangles, x, Vx, geom) for x in X])  # (nx,)
+
+    XX, YY = np.meshgrid(X, Y)
+    tau_y_field = np.tile(tau_y_row.reshape(-1, 1), (1, nx))
+    tau_x_field = np.tile(tau_x_col.reshape(1, -1), (ny, 1))
+    tau_field = np.sqrt(tau_y_field**2 + tau_x_field**2)
+
+    inside = np.zeros_like(XX, dtype=bool)
+    for x0, y0, b, h in rectangles:
+        inside |= (XX >= x0) & (XX <= x0 + b) & (YY >= y0) & (YY <= y0 + h)
+
+    tau_masked = np.where(inside, tau_field, np.nan)
+
+    # approximate max: found numerically on this grid (tau is not linear,
+    # so unlike sigma we can't guarantee the extremum sits at a corner)
+    if np.all(np.isnan(tau_masked)):
+        tau_max = 0.0
+        loc_max = (geom["x_bar"], geom["y_bar"])
+    else:
+        idx = np.nanargmax(tau_masked)
+        iy, ix = np.unravel_index(idx, tau_masked.shape)
+        tau_max = float(tau_masked[iy, ix])
+        loc_max = (float(X[ix]), float(Y[iy]))
+
+    fig = go.Figure()
+
+    vmax = max(tau_max, 1e-9)
+    fig.add_trace(go.Heatmap(
+        x=X, y=Y, z=tau_masked,
+        colorscale="Viridis", zmin=0, zmax=vmax,
+        colorbar=dict(title="\u03c4 [MPa]"),
+        hovertemplate="x=%{x:.2f} mm<br>y=%{y:.2f} mm<br>\u03c4=%{z:.2f} MPa<extra></extra>",
+    ))
+
+    shapes = _rect_shapes(rectangles, fillcolor="rgba(0,0,0,0)", opacity=1.0)
+
+    fig.add_trace(go.Scatter(
+        x=[geom["x_bar"]], y=[geom["y_bar"]], mode="markers",
+        marker=dict(color="black", size=7), showlegend=False,
+        hovertemplate="centroid<extra></extra>",
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=[loc_max[0]], y=[loc_max[1]], mode="markers",
+        marker=dict(symbol="triangle-up", color="white", size=11, line=dict(color="black", width=1.5)),
+        showlegend=False,
+        hovertemplate=f"max \u2248 {tau_max:.1f} MPa<extra></extra>",
+    ))
+    annotations = [dict(
+        x=loc_max[0], y=loc_max[1], text=f"max \u2248 {tau_max:.1f} MPa",
+        showarrow=False, font=dict(size=11, color="black"),
+        bgcolor="white", bordercolor="black", borderwidth=1,
+        xanchor="left", yanchor="bottom", xshift=10, yshift=10,
+    )]
+
+    xr, yr = _view_range(xmin, xmax, ymin, ymax)
+
+    fig.update_layout(
+        shapes=shapes, annotations=annotations,
+        xaxis=dict(range=xr, title="x [mm]", zeroline=False),
+        yaxis=dict(range=yr, title="y [mm]", zeroline=False, scaleanchor="x", scaleratio=1),
+        margin=dict(l=50, r=30, t=30, b=50), height=520,
+    )
+
+    return fig, tau_max, loc_max
+
