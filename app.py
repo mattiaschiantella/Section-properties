@@ -48,6 +48,7 @@ ping_thread.start()
 INPUT_STYLE = {"width": "90px", "marginRight": "8px"}
 BTN_STYLE = {"marginRight": "8px", "marginTop": "6px"}
 
+
 # =====================================================================
 # LAYOUT
 # =====================================================================
@@ -61,7 +62,7 @@ app.layout = html.Div([
     dcc.Store(id="store-stress", data=None),
     dcc.Store(id="store-output", data=[]),
 
-    html.H2("Section Analyzer - Dash"),
+    html.H2("Section Analyzer"),
 
     html.Div([
 
