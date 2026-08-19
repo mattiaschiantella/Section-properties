@@ -79,16 +79,18 @@ def compute_geometry(rectangles):
 def format_geometry_output(geom):
     lines = []
     lines.append(f"Total area = {geom['A_tot']:.4f} mm\u00b2")
-    lines.append(f"Centroid x\u0304 = {geom['x_bar']:.4f} mm")
-    lines.append(f"Centroid y\u0304 = {geom['y_bar']:.4f} mm")
+    lines.append("")
+    lines.append(f"Centroid coordinates")
+    lines.append(f" x' = {geom['x_bar']:.4f} mm")
+    lines.append(f" y' = {geom['y_bar']:.4f} mm")
     lines.append("")
     lines.append("Centroidal moments of inertia:")
-    lines.append(f"Ix  = {geom['Ix']:.4f} mm\u2074")
-    lines.append(f"Iy  = {geom['Iy']:.4f} mm\u2074")
-    lines.append(f"Ixy = {geom['Ixy']:.4f} mm\u2074")
+    lines.append(f"Ix'x'  = {geom['Ix']:.4f} mm\u2074")
+    lines.append(f"Iy'y'  = {geom['Iy']:.4f} mm\u2074")
+    lines.append(f"Ix'y' = {geom['Ixy']:.4f} mm\u2074")
     lines.append("")
     lines.append("Principal axes of inertia (x, y):")
-    lines.append(f"theta_p (counter-clockwise) = {np.degrees(geom['theta_p']):.4f} deg")
+    lines.append(f"θx' (counter-clockwise if positive) = {np.degrees(geom['theta_p']):.4f} deg")
     lines.append(f"I1 (max) = {geom['I1']:.4f} mm\u2074")
     lines.append(f"I2 (min) = {geom['I2']:.4f} mm\u2074")
     return lines
@@ -647,61 +649,127 @@ def _long_axis(rect):
     return "x" if b >= h else "y"
 
 
-def _find_attachments(rect, other_rects, axis):
+def _excluded_intervals(rect, rectangles):
     """
-    For 'rect' whose long axis is 'axis' ('x' or 'y'), find where OTHER
-    rectangles with the OPPOSITE long axis touch it (share an edge along
-    its span). Returns a sorted list of attachment center positions
-    along the span.
+    List of (a, b) sub-intervals along this piece's OWN long-axis span
+    where a PERPENDICULAR neighbour's own tip touches it -- i.e. the
+    neighbour terminates INTO this piece's middle (e.g. a web ending at
+    a flange). That sub-range (as wide as the neighbour's own
+    thickness) is the small corner shared by both pieces: it belongs to
+    the neighbour's zone, not to this piece's own independent length,
+    so it's excluded here (from J, from the local Jourawski tent, and
+    from the visualization) to avoid counting it twice.
     """
     x0, y0, b, h = rect
-    attachments = []
-    for orect in other_rects:
+    own_axis = _long_axis(rect)
+    intervals = []
+    for orect in rectangles:
         if orect == rect:
             continue
         ox0, oy0, ob, oh = orect
-        if axis == "x":
-            if _long_axis(orect) == "x":
-                continue  # only perpendicular neighbours attach meaningfully
-            touches = abs(oy0 - (y0 + h)) < 1e-6 or abs((oy0 + oh) - y0) < 1e-6
+        if _long_axis(orect) == own_axis:
+            continue  # only a perpendicular neighbour forms a corner
+        if own_axis == "x":
+            touches = abs(oy0 + oh - y0) < 1e-6 or abs(oy0 - (y0 + h)) < 1e-6
             if touches:
-                xa, xb = max(x0, ox0), min(x0 + b, ox0 + ob)
-                if xb > xa:
-                    attachments.append((xa + xb) / 2)
+                a, bnd = max(x0, ox0), min(x0 + b, ox0 + ob)
+                if bnd > a:
+                    intervals.append((a, bnd))
         else:
-            if _long_axis(orect) == "y":
-                continue
-            touches = abs(ox0 - (x0 + b)) < 1e-6 or abs((ox0 + ob) - x0) < 1e-6
+            touches = abs(ox0 + ob - x0) < 1e-6 or abs(ox0 - (x0 + b)) < 1e-6
             if touches:
-                ya, yb = max(y0, oy0), min(y0 + h, oy0 + oh)
-                if yb > ya:
-                    attachments.append((ya + yb) / 2)
-    return sorted(set(attachments))
+                a, bnd = max(y0, oy0), min(y0 + h, oy0 + oh)
+                if bnd > a:
+                    intervals.append((a, bnd))
+
+    intervals.sort()
+    merged = []
+    for a, bnd in intervals:
+        if merged and a <= merged[-1][1] + 1e-9:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], bnd))
+        else:
+            merged.append((a, bnd))
+    return merged
 
 
-def _tent_profile(s0, s1, thickness, arm_const, attach_positions, n=40):
+def _free_segments(s0, s1, excluded):
+    """[s0, s1] minus the excluded sub-intervals, as a list of
+    (seg_start, seg_end, is_true_tip_start, is_true_tip_end)."""
+    segs = []
+    cursor = s0
+    bounds = sorted(excluded)
+    for a, b in bounds:
+        if a > cursor:
+            segs.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < s1:
+        segs.append((cursor, s1))
+    return [(a, b, abs(a - s0) < 1e-6, abs(b - s1) < 1e-6) for a, b in segs]
+
+
+def _tent_profile(s0, s1, thickness, arm_const, excluded, n=40):
     """
     Local first-moment profile Q(s) for a piece PERPENDICULAR to V,
-    swept along its own span [s0, s1]: zero at the free tips (and at
-    the midpoints between consecutive attachments, if more than one),
-    rising linearly toward each attachment -- the classic 'tent' shape.
-    Returns (s_samples, Q_samples) with Q in mm^3 (still needs *V/I).
-    """
-    if attach_positions:
-        mids = [(a + b) / 2 for a, b in zip(attach_positions[:-1], attach_positions[1:])]
-        zero_points = [s0] + mids + [s1]
-    else:
-        zero_points = [s0, s1]
+    swept along its own span [s0, s1] MINUS the excluded sub-intervals
+    (skipped entirely -- no samples there, since that sub-range belongs
+    to the attached perpendicular piece, not to this one).
 
-    s_samples = np.linspace(s0, s1, n)
-    zp = np.array(sorted(set(zero_points)))
-    Q_samples = np.zeros_like(s_samples)
-    for i, s in enumerate(s_samples):
-        idx = np.clip(np.searchsorted(zp, s), 1, len(zp) - 1)
-        left, right = zp[idx - 1], zp[idx]
-        d = min(s - left, right - s)
-        Q_samples[i] = thickness * d * arm_const
-    return s_samples, Q_samples
+    Each free segment ramps from 0 at a TRUE free tip (s0 or s1) up to
+    a maximum at the excluded interval's edge; a segment with no true
+    tip on either side (sandwiched between two excluded intervals)
+    ramps from 0 at its own midpoint outward to each edge.
+
+    Returns (s_samples, Q_samples), Q in mm^3 (still needs *V/I).
+    """
+    segments = _free_segments(s0, s1, excluded)
+    all_s, all_Q = [], []
+    for seg_start, seg_end, is_tip_start, is_tip_end in segments:
+        if seg_end - seg_start < 1e-9:
+            continue
+        n_seg = max(int(round(n * (seg_end - seg_start) / max(s1 - s0, 1e-9))), 4)
+        seg_s = np.linspace(seg_start, seg_end, n_seg)
+        if is_tip_start and not is_tip_end:
+            d = seg_s - seg_start
+        elif is_tip_end and not is_tip_start:
+            d = seg_end - seg_s
+        elif is_tip_start and is_tip_end:
+            d = np.minimum(seg_s - seg_start, seg_end - seg_s)
+        else:
+            mid = (seg_start + seg_end) / 2
+            d = np.abs(seg_s - mid)
+        all_s.append(seg_s)
+        all_Q.append(thickness * d * arm_const)
+
+    if not all_s:
+        return np.array([]), np.array([])
+    return np.concatenate(all_s), np.concatenate(all_Q)
+
+
+def _attachment_zero_points(s0, s1, excluded):
+    """Boundaries (true tips + excluded-interval edges + sandwiched
+    midpoints) used to tell, for a given sample, which free segment and
+    which 'branch' (toward which edge) it belongs to -- for the
+    flow-direction logic."""
+    zero_points = []
+    for seg_start, seg_end, is_tip_start, is_tip_end in _free_segments(s0, s1, excluded):
+        if is_tip_start:
+            zero_points.append(seg_start)
+        if is_tip_end:
+            zero_points.append(seg_end)
+        if not is_tip_start and not is_tip_end:
+            zero_points.append((seg_start + seg_end) / 2)
+    if not zero_points:
+        zero_points = [s0, s1]
+    return np.array(sorted(set(zero_points)))
+
+
+def _branch_sign(s, zp):
+    """+1 if s is on the 'ascending' (left) side of its local zero-point
+    bracket -- i.e. increasing s moves AWAY from the nearest zero point
+    -- else -1 (s is moving TOWARD the next zero point as it increases)."""
+    idx = np.clip(np.searchsorted(zp, s), 1, len(zp) - 1)
+    left, right = zp[idx - 1], zp[idx]
+    return 1.0 if (s - left) <= (right - s) else -1.0
 
 
 def _perpendicular_piece_profile(rect, rectangles, geom, direction):
@@ -711,21 +779,20 @@ def _perpendicular_piece_profile(rect, rectangles, geom, direction):
     direction. Returns (coord_samples, tau_samples, thickness, is_x_sweep).
     """
     x0, y0, b, h = rect
+    excluded = _excluded_intervals(rect, rectangles)
     if direction == "Vy":
         # perpendicular to Vy means long axis = x
         s0, s1 = x0, x0 + b
         thickness = h
         arm_const = (y0 + h / 2) - geom["y_bar"]
-        attachments = _find_attachments(rect, rectangles, axis="x")
-        s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, attachments)
+        s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded)
         return s_samples, Q, thickness, True
     else:
         # perpendicular to Vx means long axis = y
         s0, s1 = y0, y0 + h
         thickness = b
         arm_const = (x0 + b / 2) - geom["x_bar"]
-        attachments = _find_attachments(rect, rectangles, axis="y")
-        s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, attachments)
+        s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded)
         return s_samples, Q, thickness, False
 
 
@@ -752,6 +819,19 @@ def _choose_offset_sign(rect, rectangles, axis):
         clearance_left = (x0 - max(blockers_left)) if blockers_left else float("inf")
         clearance_right = (min(blockers_right) - (x0 + b)) if blockers_right else float("inf")
         return -1 if clearance_left >= clearance_right else 1
+
+
+def _split_at_gaps(s):
+    """Indices where consecutive samples jump by much more than the
+    local step -- i.e. an excluded interval was skipped. Returns a list
+    of (start_idx, end_idx) index ranges, each a contiguous run."""
+    if len(s) < 2:
+        return [(0, len(s))]
+    diffs = np.diff(s)
+    step = np.median(diffs[diffs > 0]) if np.any(diffs > 0) else 1.0
+    breaks = np.where(diffs > 3 * step)[0]
+    bounds = [0] + list(breaks + 1) + [len(s)]
+    return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1) if bounds[i + 1] > bounds[i]]
 
 
 def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, color, line_color):
@@ -794,15 +874,16 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
                 s = np.linspace(x0, x0 + b, 40)
                 tau = np.array([tau_from_Vx(rectangles, xx, V, geom) for xx in s])
             is_x_sweep = (direction == "Vx")
-        per_piece.append((rect, s, tau, is_x_sweep))
+        per_piece.append((rect, s, tau, is_x_sweep, perpendicular))
         all_abs.append(np.max(np.abs(tau)) if len(tau) else 0.0)
 
     vmax = max(max(all_abs) if all_abs else 0.0, 1e-9)
     scale = 0.22 * span_ref / vmax
 
     per_piece_annotations = []
+    flow_annotations = []
 
-    for rect, s, tau, is_x_sweep in per_piece:
+    for rect, s, tau, is_x_sweep, perpendicular in per_piece:
         x0, y0, b, h = rect
         tau_abs = np.abs(tau)
         piece_max = float(tau_abs.max()) if tau_abs.size else 0.0
@@ -820,38 +901,75 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
             sign = _choose_offset_sign(rect, rectangles, axis="y")
             base_y = (y0 - gap) if sign < 0 else (y0 + h + gap)
             outer_y = base_y + sign * scale * tau_abs
-            poly_x = list(s) + list(s[::-1])
-            poly_y = list(outer_y) + [base_y] * len(s)
             view_ymin = min(view_ymin, outer_y.min())
             view_ymax = max(view_ymax, outer_y.max())
             peak_x, peak_y = float(s[i_peak]), float(outer_y[i_peak])
             hover_x, hover_y = s, outer_y
+            mid_y = y0 + h / 2
+            segments = [(list(s[i0:i1]) + list(s[i0:i1][::-1]),
+                         list(outer_y[i0:i1]) + [base_y] * (i1 - i0))
+                        for i0, i1 in _split_at_gaps(s)]
+            zp = _attachment_zero_points(s[0], s[-1], _excluded_intervals(rect, rectangles)) if perpendicular else None
+            flow_points = []
+            for i in np.linspace(2, len(s) - 3, 4).astype(int):
+                if abs(tau[i]) < 1e-9:
+                    continue
+                if perpendicular:
+                    dx = _branch_sign(s[i], zp) * (1.0 if tau[i] < 0 else -1.0)
+                else:
+                    dx = -1.0 if tau[i] >= 0 else 1.0
+                flow_points.append((float(s[i]), mid_y, (dx, 0.0)))
         else:
             # ribbon runs along y (s = y), bulges in x
             sign = _choose_offset_sign(rect, rectangles, axis="x")
             base_x = (x0 - gap) if sign < 0 else (x0 + b + gap)
             outer_x = base_x + sign * scale * tau_abs
-            poly_x = list(outer_x) + [base_x] * len(s)
-            poly_y = list(s) + list(s[::-1])
             view_xmin = min(view_xmin, outer_x.min())
             view_xmax = max(view_xmax, outer_x.max())
             peak_x, peak_y = float(outer_x[i_peak]), float(s[i_peak])
             hover_x, hover_y = outer_x, s
+            mid_x = x0 + b / 2
+            segments = [(list(outer_x[i0:i1]) + [base_x] * (i1 - i0),
+                         list(s[i0:i1]) + list(s[i0:i1][::-1]))
+                        for i0, i1 in _split_at_gaps(s)]
+            zp = _attachment_zero_points(s[0], s[-1], _excluded_intervals(rect, rectangles)) if perpendicular else None
+            flow_points = []
+            for i in np.linspace(2, len(s) - 3, 4).astype(int):
+                if abs(tau[i]) < 1e-9:
+                    continue
+                if perpendicular:
+                    dy = _branch_sign(s[i], zp) * (1.0 if tau[i] < 0 else -1.0)
+                else:
+                    dy = -1.0 if tau[i] >= 0 else 1.0
+                flow_points.append((mid_x, float(s[i]), (0.0, dy)))
 
-        traces.append(go.Scatter(
-            x=poly_x, y=poly_y, mode="lines", fill="toself",
-            line=dict(color=line_color, width=1.5), fillcolor=color,
-            hoverinfo="skip", showlegend=False,
-        ))
+        arrow_len = 0.10 * span_ref
+        for px, py, (dx, dy) in flow_points:
+            flow_annotations.append(dict(
+                x=px + arrow_len / 2 * dx, y=py + arrow_len / 2 * dy,
+                ax=px - arrow_len / 2 * dx, ay=py - arrow_len / 2 * dy,
+                axref="x", ayref="y", xref="x", yref="y",
+                showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.8,
+                arrowcolor=line_color, text="",
+            ))
+
+        for poly_x, poly_y in segments:
+            traces.append(go.Scatter(
+                x=poly_x, y=poly_y, mode="lines", fill="toself",
+                line=dict(color=line_color, width=1.5), fillcolor=color,
+                hoverinfo="skip", showlegend=False,
+            ))
 
         # thin invisible-ish line along the outer edge, just to enable
-        # hovering and read tau at any point along this piece
-        traces.append(go.Scatter(
-            x=list(hover_x), y=list(hover_y), mode="lines",
-            line=dict(color=line_color, width=0.5),
-            customdata=tau, hovertemplate=f"{direction}<br>\u03c4=%{{customdata:.2f}} MPa<extra></extra>",
-            showlegend=False,
-        ))
+        # hovering and read tau at any point along this piece (split at
+        # gaps too, so it doesn't bridge across an excluded interval)
+        for i0, i1 in _split_at_gaps(s):
+            traces.append(go.Scatter(
+                x=list(hover_x[i0:i1]), y=list(hover_y[i0:i1]), mode="lines",
+                line=dict(color=line_color, width=0.5),
+                customdata=tau[i0:i1], hovertemplate=f"{direction}<br>\u03c4=%{{customdata:.2f}} MPa<extra></extra>",
+                showlegend=False,
+            ))
 
         if piece_max > 1e-6:
             per_piece_annotations.append(dict(
@@ -869,7 +987,7 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
         xanchor="left", yanchor="bottom", xshift=8, yshift=8,
     )] if tau_max > 1e-9 else []
 
-    annotations = per_piece_annotations + global_annotation
+    annotations = flow_annotations + per_piece_annotations + global_annotation
 
     return traces, annotations, tau_max, loc_max, (view_xmin, view_xmax, view_ymin, view_ymax)
 
@@ -942,3 +1060,235 @@ def build_shear_figure(rectangles, geom, Vx, Vy):
     )
 
     return fig, tau_max, loc_max
+
+
+# =====================================================================
+# TORSION ON OPEN THIN-WALLED SECTIONS (Saint-Venant, membrane analogy)
+#
+# For a section built from thin rectangular segments (length L_i,
+# thickness t_i << L_i):
+#   J = (1/3) * sum(L_i * t_i^3)
+#   tau(n) = 2*T*n / J    for n in [-t_i/2, +t_i/2]  (n measured from the
+#                          segment's own mid-thickness line)
+#   tau_max,i = T*t_i / J  (at each segment's own surface)
+#
+# Shear stress is CONSTANT along a segment's length and varies LINEARLY
+# across its own thickness, zero at the mid-line. Each segment is
+# treated independently (no continuity/connectivity needed, unlike the
+# flexural Jourawski case) since Saint-Venant torsion of an open
+# section has no circulating shear flow between segments.
+#
+# Sign convention: positive T = counterclockwise, using a standard
+# right-handed frame with z pointing out of the page (toward the
+# viewer). For each rectangle, n is measured along z_hat x s_hat, where
+# s_hat is the segment's own long-axis direction (+x for horizontal
+# pieces, +y for vertical pieces).
+# =====================================================================
+
+def _torsion_effective_span(rect, rectangles):
+    """Returns (s0, s1, thickness, excluded): this rectangle's own full
+    span along its long axis, its thickness, and the list of
+    sub-intervals to exclude (shared corners with attached perpendicular
+    pieces -- see _excluded_intervals)."""
+    x0, y0, b, h = rect
+    own_axis = _long_axis(rect)
+    s0, s1 = (x0, x0 + b) if own_axis == "x" else (y0, y0 + h)
+    thickness = min(b, h)
+    excluded = _excluded_intervals(rect, rectangles)
+    return s0, s1, thickness, excluded
+
+
+def compute_torsion_constant(rectangles):
+    """J = sum(L_i * t_i^3) / 3, using each rectangle's own long side as
+    length (net of any shared corner with an attached perpendicular
+    piece) and short side as thickness."""
+    J = 0.0
+    for rect in rectangles:
+        s0, s1, thickness, excluded = _torsion_effective_span(rect, rectangles)
+        length = (s1 - s0) - sum(b - a for a, b in excluded)
+        J += max(length, 0.0) * thickness**3 / 3.0
+    return J
+
+
+def _torsion_n_field(rectangles, XX, YY):
+    """For every grid point, the signed distance n from its own
+    rectangle's mid-thickness line (NaN outside all rectangles, and
+    NaN in the small corner shared with a perpendicular attachment)."""
+    n_field = np.full(XX.shape, np.nan)
+    for rect in rectangles:
+        x0, y0, b, h = rect
+        s0, s1, _, excluded = _torsion_effective_span(rect, rectangles)
+        if b >= h:
+            mask = (XX >= x0) & (XX <= x0 + b) & (YY >= y0) & (YY <= y0 + h)
+            for a, bnd in excluded:
+                mask &= ~((XX >= a) & (XX <= bnd))
+            # x-oriented: s_hat = +x, n_hat = s_hat x z = -y (positive T = counterclockwise)
+            y_mid = y0 + h / 2
+            n_field[mask] = -(YY[mask] - y_mid)
+        else:
+            mask = (XX >= x0) & (XX <= x0 + b) & (YY >= y0) & (YY <= y0 + h)
+            for a, bnd in excluded:
+                mask &= ~((YY >= a) & (YY <= bnd))
+            # y-oriented: s_hat = +y, n_hat = s_hat x z = +x
+            x_mid = x0 + b / 2
+            n_field[mask] = (XX[mask] - x_mid)
+    return n_field
+
+
+def build_torsion_figure(rectangles, geom, T):
+    """T already in N*mm. Returns fig, tau_max, loc_max, J."""
+    J = compute_torsion_constant(rectangles)
+
+    xs = [r[0] for r in rectangles]
+    ys = [r[1] for r in rectangles]
+    x1s = [r[0] + r[2] for r in rectangles]
+    y1s = [r[1] + r[3] for r in rectangles]
+    xmin, xmax = min(xs), max(x1s)
+    ymin, ymax = min(ys), max(y1s)
+
+    nx, ny = 260, 260
+    X = np.linspace(xmin, xmax, nx)
+    Y = np.linspace(ymin, ymax, ny)
+    XX, YY = np.meshgrid(X, Y)
+
+    n_field = _torsion_n_field(rectangles, XX, YY)
+    tau_field = 2.0 * T * n_field / J if J > 0 else np.zeros_like(n_field)
+
+    # per-segment exact max (occurs at each segment's own surface, n=+-t/2)
+    tau_max = 0.0
+    loc_max = (geom["x_bar"], geom["y_bar"])
+    per_seg_annotations = []
+    flow_annotations = []
+    for x0, y0, b, h in rectangles:
+        thickness = min(b, h)
+        seg_tau_max = abs(T) * thickness / J if J > 0 else 0.0
+        if seg_tau_max > tau_max:
+            tau_max = seg_tau_max
+            loc_max = (x0 + b / 2, y0 + h / 2)
+        if seg_tau_max > 1e-6:
+            per_seg_annotations.append(dict(
+                x=x0 + b / 2, y=y0 + h / 2, text=f"{seg_tau_max:.1f}",
+                showarrow=False, font=dict(size=9, color="black"),
+            ))
+
+    vmax = max(tau_max, 1e-9)
+
+    fig = go.Figure()
+    fig.add_trace(go.Heatmap(
+        x=X, y=Y, z=tau_field,
+        colorscale="RdBu", reversescale=True, zmid=0, zmin=-vmax, zmax=vmax,
+        colorbar=dict(title="\u03c4_t [MPa]"),
+        hovertemplate="x=%{x:.2f} mm<br>y=%{y:.2f} mm<br>\u03c4=%{z:.2f} MPa<extra></extra>",
+    ))
+
+    shapes = _rect_shapes(rectangles, fillcolor="rgba(0,0,0,0)", opacity=1.0)
+
+    # ---------------- linear ribbon per rectangle, same style as the sigma diagram ----------------
+    span_ref = max(xmax - xmin, ymax - ymin, 1.0)
+    gap = 0.05 * span_ref
+    scale = 0.20 * span_ref / vmax
+    clearance = gap + scale * vmax
+    view_xmin, view_xmax, view_ymin, view_ymax = xmin, xmax, ymin, ymax
+
+    for x0, y0, b, h in rectangles:
+        rect = (x0, y0, b, h)
+        if b >= h:
+            s = np.linspace(y0, y0 + h, 20)
+            n = -(s - (y0 + h / 2))
+            tau_s = 2.0 * T * n / J if J > 0 else np.zeros_like(n)
+            sign = _choose_offset_sign(rect, rectangles, axis="x")
+            base = (x0 - clearance) if sign < 0 else (x0 + b + clearance)
+            outer = base + sign * scale * tau_s
+            poly_x, poly_y = list(outer) + [base] * len(s), list(s) + list(s[::-1])
+            hover_x, hover_y = outer, s
+            view_xmin, view_xmax = min(view_xmin, outer.min()), max(view_xmax, outer.max())
+        else:
+            s = np.linspace(x0, x0 + b, 20)
+            n = s - (x0 + b / 2)
+            tau_s = 2.0 * T * n / J if J > 0 else np.zeros_like(n)
+            sign = _choose_offset_sign(rect, rectangles, axis="y")
+            base = (y0 - clearance) if sign < 0 else (y0 + h + clearance)
+            outer = base + sign * scale * tau_s
+            poly_x, poly_y = list(s) + list(s[::-1]), list(outer) + [base] * len(s)
+            hover_x, hover_y = s, outer
+            view_ymin, view_ymax = min(view_ymin, outer.min()), max(view_ymax, outer.max())
+
+        arrow_len = 0.08 * span_ref
+        Tsign = 1.0 if T >= 0 else -1.0
+        s0, s1, _, excluded = _torsion_effective_span(rect, rectangles)
+        if abs(T) > 1e-9 and J > 0:
+            free_segs = [(a, b) for a, b, *_ in _free_segments(s0, s1, excluded) if b - a > 1e-6]
+            if b >= h:
+                for seg_a, seg_b in free_segs:
+                    xs_edge = np.linspace(seg_a + 0.1 * (seg_b - seg_a), seg_b - 0.1 * (seg_b - seg_a), 3)
+                    for xa in xs_edge:
+                        flow_annotations.append(dict(  # top edge (y0): tau sign = +Tsign
+                            x=xa + arrow_len / 2 * Tsign, y=y0, ax=xa - arrow_len / 2 * Tsign, ay=y0,
+                            axref="x", ayref="y", xref="x", yref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.6, arrowcolor="black", text="",
+                        ))
+                        flow_annotations.append(dict(  # bottom edge (y0+h): tau sign = -Tsign
+                            x=xa - arrow_len / 2 * Tsign, y=y0 + h, ax=xa + arrow_len / 2 * Tsign, ay=y0 + h,
+                            axref="x", ayref="y", xref="x", yref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.6, arrowcolor="black", text="",
+                        ))
+            else:
+                for seg_a, seg_b in free_segs:
+                    ys_edge = np.linspace(seg_a + 0.1 * (seg_b - seg_a), seg_b - 0.1 * (seg_b - seg_a), 3)
+                    for ya in ys_edge:
+                        flow_annotations.append(dict(  # right edge (x0+b): tau sign = +Tsign
+                            x=x0 + b, y=ya + arrow_len / 2 * Tsign, ax=x0 + b, ay=ya - arrow_len / 2 * Tsign,
+                            axref="x", ayref="y", xref="x", yref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.6, arrowcolor="black", text="",
+                        ))
+                        flow_annotations.append(dict(  # left edge (x0): tau sign = -Tsign
+                            x=x0, y=ya - arrow_len / 2 * Tsign, ax=x0, ay=ya + arrow_len / 2 * Tsign,
+                            axref="x", ayref="y", xref="x", yref="y",
+                            showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.6, arrowcolor="black", text="",
+                        ))
+
+        mid = len(s) // 2
+        for i0, i1, col, lcol in [(0, mid + 1, "rgba(30,60,200,0.28)", "rgba(20,40,150,0.8)"),
+                                   (mid, len(s), "rgba(200,30,30,0.28)", "rgba(150,20,20,0.8)")]:
+            if b >= h:
+                px = list(outer[i0:i1]) + [base] * (i1 - i0)
+                py = list(s[i0:i1]) + list(s[i0:i1][::-1])
+            else:
+                px = list(s[i0:i1]) + list(s[i0:i1][::-1])
+                py = list(outer[i0:i1]) + [base] * (i1 - i0)
+            fig.add_trace(go.Scatter(
+                x=px, y=py, mode="lines", fill="toself",
+                line=dict(color=lcol, width=1.2), fillcolor=col,
+                hoverinfo="skip", showlegend=False,
+            ))
+
+        fig.add_trace(go.Scatter(
+            x=list(hover_x), y=list(hover_y), mode="lines",
+            line=dict(color="rgba(0,0,0,0.4)", width=0.5),
+            customdata=tau_s, hovertemplate="\u03c4=%{customdata:.2f} MPa<extra></extra>",
+            showlegend=False,
+        ))
+
+    fig.add_trace(go.Scatter(
+        x=[geom["x_bar"]], y=[geom["y_bar"]], mode="markers",
+        marker=dict(color="black", size=7), showlegend=False,
+        hovertemplate="centroid<extra></extra>",
+    ))
+
+    annotations = flow_annotations + per_seg_annotations + [dict(
+        x=loc_max[0], y=loc_max[1], text=f"max \u2248 {tau_max:.2f} MPa",
+        showarrow=False, font=dict(size=11, color="black"),
+        bgcolor="white", bordercolor="black", borderwidth=1,
+        xanchor="left", yanchor="bottom", xshift=8, yshift=8,
+    )] if tau_max > 1e-9 else flow_annotations + per_seg_annotations
+
+    xr, yr = _view_range(view_xmin, view_xmax, view_ymin, view_ymax)
+
+    fig.update_layout(
+        shapes=shapes, annotations=annotations,
+        xaxis=dict(range=xr, title="x [mm]", zeroline=False),
+        yaxis=dict(range=yr, title="y [mm]", zeroline=False, scaleanchor="x", scaleratio=1),
+        margin=dict(l=50, r=30, t=30, b=50), height=560,
+    )
+
+    return fig, tau_max, loc_max, J
