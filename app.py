@@ -9,10 +9,10 @@ from dash.exceptions import PreventUpdate
 from compute import (
     rects_overlap, compute_geometry, format_geometry_output,
     compute_stress_extremes, build_geometry_figure, build_stress_figure,
-    build_shear_figure,
+    build_shear_figure, build_torsion_figure, compute_torsion_constant,
 )
 
-app = dash.Dash(__name__)
+app = dash.Dash(__name__, suppress_callback_exceptions=True)
 app.title = "Section Analyzer"
 server = app.server  # needed by gunicorn/Render: exposes the underlying Flask app
 
@@ -88,7 +88,17 @@ app.layout = html.Div([
                        style={"color": "gray", "fontSize": "0.85em", "marginTop": "8px"}),
             ]),
 
-            html.Div(id="warning-div"),
+            # Static, always-present component: avoids the classic Dash pitfall
+            # of dynamically recreating "confirm/cancel" buttons that don't
+            # exist in the initial layout. The browser's own Cancel button
+            # never touches the server, so it can never add the rectangle.
+            dcc.ConfirmDialog(
+                id="confirm-overlap",
+                message=("The current rectangle is overlapping the previous ones. "
+                          "If you continue, the shared part will be counted twice "
+                          "in the area, centroid and moment of inertia calculations. "
+                          "Press OK to add it anyway, or Cancel to discard it."),
+            ),
 
             html.Fieldset([
                 html.Legend("Defined rectangles"),
@@ -111,10 +121,13 @@ app.layout = html.Div([
                 html.Div([
                     dcc.Input(id="in-Vx", type="number", placeholder="Vx [kN]", style=INPUT_STYLE),
                     dcc.Input(id="in-Vy", type="number", placeholder="Vy [kN]", style=INPUT_STYLE),
+                    dcc.Input(id="in-T", type="number", placeholder="Mz [kN\u00b7m]", style=INPUT_STYLE),
                 ], style={"marginTop": "6px"}),
-                html.P("Shear stresses (\u03c4) use the approximate Jourawski method: "
-                       "uniform-across-cut assumption, Vx and Vy treated independently "
-                       "and combined as a vector magnitude.",
+                html.P("Shear from Vx/Vy uses the Jourawski method (linear along segments "
+                       "perpendicular to V, parabolic along segments parallel to it). "
+                       "Torsional shear (Mz) uses the open thin-walled section theory: "
+                       "constant along each segment's length, linear across its thickness. "
+                       "Positive T = counterclockwise.",
                        style={"color": "gray", "fontSize": "0.8em", "marginTop": "6px"}),
                 html.Button("Compute stresses", id="btn-compute-stress", n_clicks=0, style=BTN_STYLE),
             ]),
@@ -139,6 +152,9 @@ app.layout = html.Div([
                 dcc.Tab(label="Shear stress map \u03c4 [MPa]", children=[
                     dcc.Graph(id="shear-graph", config={"displaylogo": False}),
                 ]),
+                dcc.Tab(label="Torsional shear \u03c4_t [MPa]", children=[
+                    dcc.Graph(id="torsion-graph", config={"displaylogo": False}),
+                ]),
             ]),
         ], style={"flex": "2", "minWidth": "500px"}),
 
@@ -157,6 +173,11 @@ app.layout = html.Div([
     Output("store-geom", "data"),
     Output("store-stress", "data"),
     Output("form-error", "children"),
+    Output("confirm-overlap", "displayed"),
+    Output("in-x0", "value"),
+    Output("in-y0", "value"),
+    Output("in-b", "value"),
+    Output("in-h", "value"),
     Input("btn-add", "n_clicks"),
     State("in-x0", "value"), State("in-y0", "value"),
     State("in-b", "value"), State("in-h", "value"),
@@ -167,15 +188,21 @@ def add_rectangle(n_clicks, x0, y0, b, h, rects):
     rects = rects or []
 
     if None in (x0, y0, b, h):
-        return no_update, no_update, no_update, no_update, "Invalid input values"
+        return (no_update, no_update, no_update, no_update,
+                "Invalid input values", False,
+                no_update, no_update, no_update, no_update)
 
     new_rect = [x0, y0, b, h]
     if any(rects_overlap(tuple(new_rect), tuple(r)) for r in rects):
-        # don't append yet: wait for explicit confirmation
-        return no_update, new_rect, no_update, no_update, ""
+        # don't append yet: store it as pending and pop the confirm dialog.
+        # Nothing is written to store-rects here, so a Cancel click (which
+        # never even reaches the server) cannot possibly add the rectangle.
+        return (no_update, new_rect, no_update, no_update, "", True,
+                no_update, no_update, no_update, no_update)
 
     rects = rects + [new_rect]
-    return rects, None, None, None, ""
+    # rectangle accepted outright: clear the form for the next entry
+    return rects, None, None, None, "", False, None, None, None, None
 
 
 @app.callback(
@@ -183,41 +210,22 @@ def add_rectangle(n_clicks, x0, y0, b, h, rects):
     Output("store-pending", "data", allow_duplicate=True),
     Output("store-geom", "data", allow_duplicate=True),
     Output("store-stress", "data", allow_duplicate=True),
-    Input("btn-confirm-add", "n_clicks"),
+    Output("in-x0", "value", allow_duplicate=True),
+    Output("in-y0", "value", allow_duplicate=True),
+    Output("in-b", "value", allow_duplicate=True),
+    Output("in-h", "value", allow_duplicate=True),
+    Input("confirm-overlap", "submit_n_clicks"),
     State("store-pending", "data"), State("store-rects", "data"),
     prevent_initial_call=True,
 )
-def confirm_add(n_clicks, pending, rects):
+def confirm_add(submit_n_clicks, pending, rects):
+    # This callback only fires when the user presses OK in the native
+    # browser dialog. Pressing Cancel (or closing it) never triggers any
+    # server callback at all, so store-rects is untouched in that case.
     if not pending:
         raise PreventUpdate
     rects = (rects or []) + [pending]
-    return rects, None, None, None
-
-
-@app.callback(
-    Output("store-pending", "data", allow_duplicate=True),
-    Input("btn-cancel-add", "n_clicks"),
-    prevent_initial_call=True,
-)
-def cancel_add(n_clicks):
-    return None
-
-
-@app.callback(
-    Output("warning-div", "children"),
-    Input("store-pending", "data"),
-)
-def show_warning(pending):
-    if not pending:
-        return None
-    return html.Div([
-        html.P("The current rectangle is overlapping the previous ones. If you continue, "
-               "the shared part will be counted twice in the area, centroid and moment "
-               "of inertia calculations."),
-        html.Button("Add anyway", id="btn-confirm-add", n_clicks=0, style=BTN_STYLE),
-        html.Button("Cancel", id="btn-cancel-add", n_clicks=0, style=BTN_STYLE),
-    ], style={"background": "#fff3cd", "border": "1px solid #ffe69c", "padding": "10px",
-              "marginBottom": "10px"})
+    return rects, None, None, None, None, None, None, None
 
 
 @app.callback(
@@ -280,11 +288,11 @@ def compute_geometry_cb(n_clicks, rects):
     Output("store-output", "data", allow_duplicate=True),
     Input("btn-compute-stress", "n_clicks"),
     State("in-Mx", "value"), State("in-My", "value"), State("in-N", "value"),
-    State("in-Vx", "value"), State("in-Vy", "value"),
-    State("store-rects", "data"), State("store-geom", "data"), State("store-output", "data"),
+    State("in-Vx", "value"), State("in-Vy", "value"), State("in-T", "value"),
+    State("store-rects", "data"), State("store-geom", "data"),
     prevent_initial_call=True,
 )
-def compute_stress_cb(n_clicks, Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, rects, geom, output_lines):
+def compute_stress_cb(n_clicks, Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, T_kNm, rects, geom):
     if not rects or not geom:
         raise PreventUpdate
 
@@ -295,18 +303,22 @@ def compute_stress_cb(n_clicks, Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, rects, geom,
     N_kN = N_kN if N_kN is not None else 0.0
     Vx_kN = Vx_kN if Vx_kN is not None else 0.0
     Vy_kN = Vy_kN if Vy_kN is not None else 0.0
+    T_kNm = T_kNm if T_kNm is not None else 0.0
 
     Mx = Mx_kNm * 1.0e6
     My = My_kNm * 1.0e6
     N = N_kN * 1.0e3
     Vx = Vx_kN * 1.0e3
     Vy = Vy_kN * 1.0e3
+    T = T_kNm * 1.0e6
 
     sigma_max, loc_max, sigma_min, loc_min = compute_stress_extremes(
         [tuple(r) for r in rects], Mx, My, N, geom
     )
 
-    lines = (output_lines or []) + [
+    # rebuilt fresh every time (geometry text + this run's stress block only),
+    # so repeated clicks refresh the results instead of stacking them
+    lines = format_geometry_output(geom) + [
         "",
         "---- Normal stresses (biaxial bending + axial force) ----",
         f"Mx = {Mx_kNm:.4f} kN\u00b7m, My = {My_kNm:.4f} kN\u00b7m, N = {N_kN:.4f} kN",
@@ -326,7 +338,17 @@ def compute_stress_cb(n_clicks, Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, rects, geom,
             f"(x={loc_tau_max[0]:.3f}, y={loc_tau_max[1]:.3f}) mm",
         ]
 
-    return [Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN], lines
+    if T != 0.0:
+        _, tau_t_max, loc_t_max, J = build_torsion_figure([tuple(r) for r in rects], geom, T)
+        lines += [
+            "",
+            "---- Torsional shear stress (open thin-walled section) ----",
+            f"Mz = {T_kNm:.4f} kN\u00b7m (positive = counterclockwise)",
+            f"J = {J:.4f} mm\u2074",
+            f"Tau_t max = {tau_t_max:.4f} MPa  at (x={loc_t_max[0]:.3f}, y={loc_t_max[1]:.3f}) mm",
+        ]
+
+    return [Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, T_kNm], lines
 
 
 @app.callback(
@@ -357,7 +379,7 @@ def render_stress_graph(stress_inputs, geom, rects):
     if not stress_inputs or not geom or not rects:
         return {}
     rects = [tuple(r) for r in rects]
-    Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN = stress_inputs
+    Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, T_kNm = stress_inputs
     Mx, My, N = Mx_kNm * 1.0e6, My_kNm * 1.0e6, N_kN * 1.0e3
     fig, *_ = build_stress_figure(rects, geom, Mx, My, N)
     return fig
@@ -373,9 +395,25 @@ def render_shear_graph(stress_inputs, geom, rects):
     if not stress_inputs or not geom or not rects:
         return {}
     rects = [tuple(r) for r in rects]
-    Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN = stress_inputs
+    Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, T_kNm = stress_inputs
     Vx, Vy = Vx_kN * 1.0e3, Vy_kN * 1.0e3
     fig, *_ = build_shear_figure(rects, geom, Vx, Vy)
+    return fig
+
+
+@app.callback(
+    Output("torsion-graph", "figure"),
+    Input("store-stress", "data"),
+    Input("store-geom", "data"),
+    State("store-rects", "data"),
+)
+def render_torsion_graph(stress_inputs, geom, rects):
+    if not stress_inputs or not geom or not rects:
+        return {}
+    rects = [tuple(r) for r in rects]
+    Mx_kNm, My_kNm, N_kN, Vx_kN, Vy_kN, T_kNm = stress_inputs
+    T = T_kNm * 1.0e6
+    fig, *_ = build_torsion_figure(rects, geom, T)
     return fig
 
 
