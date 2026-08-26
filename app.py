@@ -49,6 +49,37 @@ INPUT_STYLE = {"width": "90px", "marginRight": "8px"}
 BTN_STYLE = {"marginRight": "8px", "marginTop": "6px"}
 
 
+def _make_banner(lines, width=156):
+    """Build a comment-style ASCII banner with '#' perfectly right-aligned.
+
+    Padding is computed here (not typed by hand) so the border can never
+    get out of alignment, regardless of font/line length.
+    """
+    border = "#" * (width + 4)  # "# " + content + " #"
+    out = [border]
+    for line in lines:
+        if line == "":
+            body = ""
+        else:
+            body = line
+        # content area is (width) chars wide, left-aligned, padded with spaces
+        padded = body.ljust(width)
+        out.append(f"# {padded} #")
+    out.append(border)
+    return "\n".join(out)
+
+
+AUTHOR_BANNER = _make_banner([
+    "This script was written by",
+    "    Mattia Schiantella, PhD",
+    "    Department of Civil and Environmental Engineering, University of Perugia, Italy",
+    "    e-mail: mattia.schiantella@unipg.it",
+    "",
+    "Disclaimer:",
+    "The author does not guarantee that the script is free from errors; the app is intended for educational purposes, please report any bug by sending an e-mail.",
+])
+
+
 # =====================================================================
 # LAYOUT
 # =====================================================================
@@ -62,7 +93,21 @@ app.layout = html.Div([
     dcc.Store(id="store-stress", data=None),
     dcc.Store(id="store-output", data=[]),
 
-    html.H2("Section Analyzer"),
+    html.H2("Section Properties and Stress Analysis"),
+
+    # ---------------- author / credits box ----------------
+    html.Pre(AUTHOR_BANNER, style={
+        "border": "1px solid #ddd",
+        "borderRadius": "6px",
+        "padding": "10px 14px",
+        "marginBottom": "16px",
+        "backgroundColor": "#f8f9fa",
+        "fontFamily": "monospace",
+        "fontSize": "0.85em",
+        "lineHeight": "1.3",
+        "display": "inline-block",
+        "whiteSpace": "pre",
+    }),
 
     html.Div([
 
@@ -82,10 +127,13 @@ app.layout = html.Div([
                     html.Button("Compute geometry", id="btn-compute-geom", n_clicks=0, style=BTN_STYLE),
                 ]),
                 html.Div(id="form-error", style={"color": "red", "marginTop": "4px"}),
-                html.P("Reference system: x positive to the LEFT, y positive DOWNWARD "
-                       "(Structural mechanics De Saint Venant's convention). "
-                       "x0, y0, base, height are in mm.",
-                       style={"color": "gray", "fontSize": "0.85em", "marginTop": "8px"}),
+                html.P([
+                    "Reference system: x positive to the LEFT, y positive DOWNWARD",
+                    html.Br(),
+                    "(Structural mechanics De Saint Venant's convention).",
+                    html.Br(),
+                    "x0, y0, base, height are in mm.",
+                ], style={"color": "gray", "fontSize": "0.85em", "marginTop": "8px"}),
             ]),
 
             # Static, always-present component: avoids the classic Dash pitfall
@@ -123,12 +171,13 @@ app.layout = html.Div([
                     dcc.Input(id="in-Vy", type="number", placeholder="Vy [kN]", style=INPUT_STYLE),
                     dcc.Input(id="in-T", type="number", placeholder="Mz [kN\u00b7m]", style=INPUT_STYLE),
                 ], style={"marginTop": "6px"}),
-                html.P("Shear from Vx/Vy uses the Jourawski method (linear along segments "
-                       "perpendicular to V, parabolic along segments parallel to it). "
-                       "Torsional shear (Mz) uses the open thin-walled section theory: "
-                       "constant along each segment's length, linear across its thickness. "
-                       "Positive T = counterclockwise.",
-                       style={"color": "gray", "fontSize": "0.8em", "marginTop": "6px"}),
+                html.P([
+                    "Shear stress is evaluated separately for Vx e Vy components.",
+                    html.Br(),
+                    "Torsional shear stress can be evaluated only for open cross-sections.",
+                    html.Br(),
+                    "The torsional moment Mz is considered positive if counterclockwise.",
+                ], style={"color": "gray", "fontSize": "0.8em", "marginTop": "6px"}),
                 html.Button("Compute stresses", id="btn-compute-stress", n_clicks=0, style=BTN_STYLE),
             ]),
 
@@ -201,8 +250,10 @@ def add_rectangle(n_clicks, x0, y0, b, h, rects):
                 no_update, no_update, no_update, no_update)
 
     rects = rects + [new_rect]
-    # rectangle accepted outright: clear the form for the next entry
-    return rects, None, None, None, "", False, None, None, None, None
+    # rectangle accepted: keep the input fields as they are (do NOT reset
+    # them to None here — see note above about dcc.Input losing a value of
+    # 0 on a None -> 0 transition).
+    return rects, None, None, None, "", False, no_update, no_update, no_update, no_update
 
 
 @app.callback(
@@ -225,7 +276,9 @@ def confirm_add(submit_n_clicks, pending, rects):
     if not pending:
         raise PreventUpdate
     rects = (rects or []) + [pending]
-    return rects, None, None, None, None, None, None, None
+    # keep the input fields as they are (do NOT reset to None, see note
+    # in add_rectangle about the None -> 0 transition losing the value 0)
+    return rects, None, None, None, no_update, no_update, no_update, no_update
 
 
 @app.callback(
