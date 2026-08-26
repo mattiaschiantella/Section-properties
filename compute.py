@@ -692,9 +692,56 @@ def _excluded_intervals(rect, rectangles):
     return merged
 
 
+def _branch_moment(entry, rectangles, arm_fn, visited):
+    """
+    Total first moment (area * arm) of `entry` plus everything
+    transitively attached to it (any rectangle touching it, or touching
+    something that touches it, and so on), excluding pieces already in
+    `visited` -- used to avoid walking back the way we came.
+
+    This lets a piece that starts its sweep NOT at a genuine free tip
+    (e.g. the web of a C-section, attached to a flange at both ends)
+    correctly account for the full static moment of everything attached
+    "before" that end, instead of starting from zero.
+    """
+    if entry in visited:
+        return 0.0
+    visited.add(entry)
+    x0, y0, b, h = entry
+    total = (b * h) * arm_fn(entry)
+    for other in rectangles:
+        if other in visited:
+            continue
+        if _rects_touch(entry, other):
+            total += _branch_moment(other, rectangles, arm_fn, visited)
+    return total
+
+
+def _end_neighbors(rect, rectangles, own_axis, end):
+    """Other rectangles that continue from this piece's own `end` ('s0'
+    or 's1' along its own long axis) -- e.g. an angle/L-shape corner, a
+    C-section's flange-to-web joint, or two collinear pieces placed end
+    to end."""
+    x0, y0, b, h = rect
+    s0, s1 = (x0, x0 + b) if own_axis == "x" else (y0, y0 + h)
+    target = s0 if end == "s0" else s1
+    out = []
+    for other in rectangles:
+        if other == rect:
+            continue
+        ox0, oy0, ob, oh = other
+        os0, os1 = (ox0, ox0 + ob) if own_axis == "x" else (oy0, oy0 + oh)
+        if (abs(os1 - target) < 1e-6 or abs(os0 - target) < 1e-6) and _rects_touch(rect, other):
+            out.append(other)
+    return out
+
+
 def _free_segments(s0, s1, excluded):
     """[s0, s1] minus the excluded sub-intervals, as a list of
-    (seg_start, seg_end, is_true_tip_start, is_true_tip_end)."""
+    (seg_start, seg_end, is_true_tip_start, is_true_tip_end) --
+    positional only (True when that edge coincides with s0/s1); whether
+    that end is an ACTUAL free tip is decided separately in
+    _tent_profile via s0_is_free/s1_is_free."""
     segs = []
     cursor = s0
     bounds = sorted(excluded)
@@ -707,41 +754,81 @@ def _free_segments(s0, s1, excluded):
     return [(a, b, abs(a - s0) < 1e-6, abs(b - s1) < 1e-6) for a, b in segs]
 
 
-def _tent_profile(s0, s1, thickness, arm_const, excluded, n=40):
+def _tent_profile(s0, s1, thickness, arm_const, excluded,
+                   s0_is_free=True, s1_is_free=True,
+                   q_at_s0=0.0, q_at_s1=0.0, n=40):
     """
     Local first-moment profile Q(s) for a piece PERPENDICULAR to V,
     swept along its own span [s0, s1] MINUS the excluded sub-intervals
     (skipped entirely -- no samples there, since that sub-range belongs
-    to the attached perpendicular piece, not to this one).
+    to a perpendicular T-junction neighbour, not to this piece's own
+    independent length; its own local material there is not re-added,
+    since it's already counted on the neighbour's side).
 
-    Each free segment ramps from 0 at a TRUE free tip (s0 or s1) up to
-    a maximum at the excluded interval's edge; a segment with no true
-    tip on either side (sandwiched between two excluded intervals)
-    ramps from 0 at its own midpoint outward to each edge.
+    s0_is_free / s1_is_free: False when another rectangle continues
+    from that end (e.g. an angle/L-shape corner, a C-section's
+    flange-to-web joint, or two collinear pieces joined end to end).
+    q_at_s0 / q_at_s1: the first moment already accumulated by
+    whatever is attached at that end (0.0 if that end is free).
+
+    - If s0 is not free: the sweep is anchored at s0 with q_at_s0 and
+      accumulates monotonically forward all the way to s1 (through any
+      interior T-junction gaps, whose local material is skipped but the
+      running total is otherwise carried straight through).
+    - Else if s1 is not free: mirrored, anchored at s1.
+    - Else (both ends genuinely free): classical symmetric tent --
+      each free segment ramps from 0 at its own true tip(s).
 
     Returns (s_samples, Q_samples), Q in mm^3 (still needs *V/I).
     """
     segments = _free_segments(s0, s1, excluded)
-    all_s, all_Q = [], []
-    for seg_start, seg_end, is_tip_start, is_tip_end in segments:
-        if seg_end - seg_start < 1e-9:
-            continue
-        n_seg = max(int(round(n * (seg_end - seg_start) / max(s1 - s0, 1e-9))), 4)
-        seg_s = np.linspace(seg_start, seg_end, n_seg)
-        if is_tip_start and not is_tip_end:
-            d = seg_s - seg_start
-        elif is_tip_end and not is_tip_start:
-            d = seg_end - seg_s
-        elif is_tip_start and is_tip_end:
-            d = np.minimum(seg_s - seg_start, seg_end - seg_s)
-        else:
-            mid = (seg_start + seg_end) / 2
-            d = np.abs(seg_s - mid)
-        all_s.append(seg_s)
-        all_Q.append(thickness * d * arm_const)
-
-    if not all_s:
+    segments = [(a, b, ts, te) for a, b, ts, te in segments if b - a > 1e-9]
+    if not segments:
         return np.array([]), np.array([])
+
+    def _n_for(seg_start, seg_end):
+        return max(int(round(n * (seg_end - seg_start) / max(s1 - s0, 1e-9))), 4)
+
+    all_s, all_Q = [], []
+
+    if s0_is_free and s1_is_free:
+        # both ends genuinely free -> classical symmetric tent
+        for seg_start, seg_end, is_tip_start, is_tip_end in segments:
+            seg_s = np.linspace(seg_start, seg_end, _n_for(seg_start, seg_end))
+            if is_tip_start and not is_tip_end:
+                d = seg_s - seg_start
+            elif is_tip_end and not is_tip_start:
+                d = seg_end - seg_s
+            elif is_tip_start and is_tip_end:
+                d = np.minimum(seg_s - seg_start, seg_end - seg_s)
+            else:
+                mid = (seg_start + seg_end) / 2
+                d = np.abs(seg_s - mid)
+            all_s.append(seg_s)
+            all_Q.append(thickness * d * arm_const)
+    elif (not s0_is_free) and s1_is_free:
+        # only s1 is a genuine free tip -> anchor backward from s1 (q_at_s1 = 0)
+        running = q_at_s1
+        rev_s, rev_Q = [], []
+        for seg_start, seg_end, _, _ in reversed(segments):
+            seg_s = np.linspace(seg_start, seg_end, _n_for(seg_start, seg_end))
+            d = seg_end - seg_s
+            rev_s.append(seg_s)
+            rev_Q.append(running + thickness * d * arm_const)
+            running = running + thickness * (seg_end - seg_start) * arm_const
+        all_s = list(reversed(rev_s))
+        all_Q = list(reversed(rev_Q))
+    else:
+        # s0 is free (q_at_s0 = 0), OR neither end is free (q_at_s0 is the
+        # actual branch moment there) -> anchor forward from s0 either way
+        running = q_at_s0
+        for seg_start, seg_end, _, _ in segments:
+            seg_s = np.linspace(seg_start, seg_end, _n_for(seg_start, seg_end))
+            d = seg_s - seg_start
+            all_s.append(seg_s)
+            all_Q.append(running + thickness * d * arm_const)
+            running = running + thickness * (seg_end - seg_start) * arm_const
+
     return np.concatenate(all_s), np.concatenate(all_Q)
 
 
@@ -772,6 +859,25 @@ def _branch_sign(s, zp):
     return 1.0 if (s - left) <= (right - s) else -1.0
 
 
+def _rects_touch(r1, r2, tol=1e-6):
+    """General adjacency check: True if r1 and r2 share a boundary
+    segment of positive length, regardless of their relative
+    orientation. Covers T-junctions (a web ending flush at a flange)
+    AND corner/end-to-end joins (e.g. an angle/L-shape corner, or two
+    collinear pieces placed end to end)."""
+    x0, y0, b, h = r1
+    ox0, oy0, ob, oh = r2
+    x1, y1 = x0 + b, y0 + h
+    ox1, oy1 = ox0 + ob, oy0 + oh
+    if abs(x1 - ox0) < tol or abs(ox1 - x0) < tol:
+        if min(y1, oy1) - max(y0, oy0) > tol:
+            return True
+    if abs(y1 - oy0) < tol or abs(oy1 - y0) < tol:
+        if min(x1, ox1) - max(x0, ox0) > tol:
+            return True
+    return False
+
+
 def _perpendicular_piece_profile(rect, rectangles, geom, direction):
     """
     Local linear tau(s) profile for a piece PERPENDICULAR to the given
@@ -782,18 +888,34 @@ def _perpendicular_piece_profile(rect, rectangles, geom, direction):
     excluded = _excluded_intervals(rect, rectangles)
     if direction == "Vy":
         # perpendicular to Vy means long axis = x
+        own_axis = "x"
         s0, s1 = x0, x0 + b
         thickness = h
         arm_const = (y0 + h / 2) - geom["y_bar"]
-        s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded)
-        return s_samples, Q, thickness, True
+        arm_fn = lambda r: (r[1] + r[3] / 2) - geom["y_bar"]
+        is_x_sweep = True
     else:
         # perpendicular to Vx means long axis = y
+        own_axis = "y"
         s0, s1 = y0, y0 + h
         thickness = b
         arm_const = (x0 + b / 2) - geom["x_bar"]
-        s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded)
-        return s_samples, Q, thickness, False
+        arm_fn = lambda r: (r[0] + r[2] / 2) - geom["x_bar"]
+        is_x_sweep = False
+
+    nb_s0 = _end_neighbors(rect, rectangles, own_axis, "s0")
+    nb_s1 = _end_neighbors(rect, rectangles, own_axis, "s1")
+    s0_is_free = not nb_s0
+    s1_is_free = not nb_s1
+    # branch moment of everything attached beyond each end (0.0 if free);
+    # `{rect}` seeds `visited` so the recursion never walks back into
+    # this same piece.
+    q_at_s0 = sum(_branch_moment(nb, rectangles, arm_fn, {rect}) for nb in nb_s0)
+    q_at_s1 = sum(_branch_moment(nb, rectangles, arm_fn, {rect}) for nb in nb_s1)
+
+    s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded,
+                                  s0_is_free, s1_is_free, q_at_s0, q_at_s1)
+    return s_samples, Q, thickness, is_x_sweep
 
 
 def _choose_offset_sign(rect, rectangles, axis):
@@ -869,10 +991,22 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
         else:
             if direction == "Vy":
                 s = np.linspace(y0, y0 + h, 40)
-                tau = np.array([tau_from_Vy(rectangles, yy, V, geom) for yy in s])
+                # nudge the evaluation points (not the displayed range)
+                # strictly inside this piece's own thickness: sampling
+                # tau_from_Vy() exactly AT a shared boundary with another
+                # rectangle (e.g. where a flange ends and this web
+                # begins) is ambiguous for _width_at_y(), which counts
+                # BOTH pieces' widths there (ends are inclusive on both
+                # sides) -- overstating b and understating tau right at
+                # the transition.
+                eps = max(h * 1e-6, 1e-9)
+                s_eval = np.clip(s, y0 + eps, y0 + h - eps)
+                tau = np.array([tau_from_Vy(rectangles, yy, V, geom) for yy in s_eval])
             else:
                 s = np.linspace(x0, x0 + b, 40)
-                tau = np.array([tau_from_Vx(rectangles, xx, V, geom) for xx in s])
+                eps = max(b * 1e-6, 1e-9)
+                s_eval = np.clip(s, x0 + eps, x0 + b - eps)
+                tau = np.array([tau_from_Vx(rectangles, xx, V, geom) for xx in s_eval])
             is_x_sweep = (direction == "Vx")
         per_piece.append((rect, s, tau, is_x_sweep, perpendicular))
         all_abs.append(np.max(np.abs(tau)) if len(tau) else 0.0)
