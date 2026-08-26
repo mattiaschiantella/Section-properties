@@ -832,31 +832,58 @@ def _tent_profile(s0, s1, thickness, arm_const, excluded,
     return np.concatenate(all_s), np.concatenate(all_Q)
 
 
-def _attachment_zero_points(s0, s1, excluded):
-    """Boundaries (true tips + excluded-interval edges + sandwiched
-    midpoints) used to tell, for a given sample, which free segment and
-    which 'branch' (toward which edge) it belongs to -- for the
-    flow-direction logic."""
-    zero_points = []
+def _branch_direction(s0, s1, excluded, s0_is_free, s1_is_free, s_samples):
+    """
+    Sign relating the physical coordinate s to the growth of the cut
+    ("corda") coordinate along this piece, for every point in
+    `s_samples`. This MUST mirror exactly the anchoring logic used in
+    _tent_profile to build Q(s) -- the flow-arrow direction depends on
+    how the ideal cut actually advances through this piece, not on its
+    position alone.
+
+    +1: increasing physical s means the cut is advancing further (Q
+        growing) in the +s direction.
+    -1: increasing physical s means the cut is advancing further in
+        the -s direction (e.g. a piece anchored backward from a free
+        tip at s1 because its other end, s0, is attached to a
+        neighbour and is therefore NOT where the cut starts).
+
+    Using the piece's own s0/s1 as "zero points" regardless of whether
+    that end is a genuine free tip (as a naive position-only check
+    would) gives the wrong direction whenever a piece has one or both
+    ends attached to a neighbour (T/C/L-shaped built-up sections) --
+    exactly the case _tent_profile handles with s0_is_free/s1_is_free.
+    """
+    s_samples = np.asarray(s_samples, dtype=float)
+
+    if (not s0_is_free) and s1_is_free:
+        # anchored backward from s1 (the only genuine free tip): the
+        # cut advances toward DECREASING s everywhere in this piece.
+        return -np.ones_like(s_samples)
+
+    if not (s0_is_free and s1_is_free):
+        # s0 free (s1 attached), or neither end free: _tent_profile
+        # anchors forward from s0 either way, running the total
+        # straight through any interior T-junction gaps -- so the cut
+        # advances toward INCREASING s everywhere in this piece.
+        return np.ones_like(s_samples)
+
+    # both ends genuinely free -> classical symmetric tent: each free
+    # segment ramps away from its own true tip(s), exactly as in
+    # _tent_profile's "both free" branch.
+    sign = np.ones_like(s_samples)
     for seg_start, seg_end, is_tip_start, is_tip_end in _free_segments(s0, s1, excluded):
-        if is_tip_start:
-            zero_points.append(seg_start)
-        if is_tip_end:
-            zero_points.append(seg_end)
-        if not is_tip_start and not is_tip_end:
-            zero_points.append((seg_start + seg_end) / 2)
-    if not zero_points:
-        zero_points = [s0, s1]
-    return np.array(sorted(set(zero_points)))
-
-
-def _branch_sign(s, zp):
-    """+1 if s is on the 'ascending' (left) side of its local zero-point
-    bracket -- i.e. increasing s moves AWAY from the nearest zero point
-    -- else -1 (s is moving TOWARD the next zero point as it increases)."""
-    idx = np.clip(np.searchsorted(zp, s), 1, len(zp) - 1)
-    left, right = zp[idx - 1], zp[idx]
-    return 1.0 if (s - left) <= (right - s) else -1.0
+        mask = (s_samples >= seg_start - 1e-9) & (s_samples <= seg_end + 1e-9)
+        if not np.any(mask):
+            continue
+        if is_tip_start and not is_tip_end:
+            sign[mask] = 1.0
+        elif is_tip_end and not is_tip_start:
+            sign[mask] = -1.0
+        else:
+            mid = (seg_start + seg_end) / 2
+            sign[mask] = np.where(s_samples[mask] <= mid, 1.0, -1.0)
+    return sign
 
 
 def _rects_touch(r1, r2, tol=1e-6):
@@ -882,7 +909,10 @@ def _perpendicular_piece_profile(rect, rectangles, geom, direction):
     """
     Local linear tau(s) profile for a piece PERPENDICULAR to the given
     shear direction ('Vy' or 'Vx') -- i.e. a 'flange' for that
-    direction. Returns (coord_samples, tau_samples, thickness, is_x_sweep).
+    direction. Returns (coord_samples, tau_samples, thickness,
+    is_x_sweep, s0_is_free, s1_is_free) -- the free-end flags are
+    returned too so callers can derive the correct flow-arrow direction
+    (see _branch_direction) without recomputing the neighbour lookup.
     """
     x0, y0, b, h = rect
     excluded = _excluded_intervals(rect, rectangles)
@@ -915,7 +945,7 @@ def _perpendicular_piece_profile(rect, rectangles, geom, direction):
 
     s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded,
                                   s0_is_free, s1_is_free, q_at_s0, q_at_s1)
-    return s_samples, Q, thickness, is_x_sweep
+    return s_samples, Q, thickness, is_x_sweep, s0_is_free, s1_is_free
 
 
 def _choose_offset_sign(rect, rectangles, axis):
@@ -982,8 +1012,10 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
     for rect in rectangles:
         x0, y0, b, h = rect
         perpendicular = (_long_axis(rect) == "x") if direction == "Vy" else (_long_axis(rect) == "y")
+        s0_is_free = s1_is_free = None
         if perpendicular:
-            s, Q, thickness, is_x_sweep = _perpendicular_piece_profile(rect, rectangles, geom, direction)
+            s, Q, thickness, is_x_sweep, s0_is_free, s1_is_free = _perpendicular_piece_profile(
+                rect, rectangles, geom, direction)
             if direction == "Vy":
                 tau = V * Q / (geom["Ix"] * thickness)
             else:
@@ -1008,7 +1040,7 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
                 s_eval = np.clip(s, x0 + eps, x0 + b - eps)
                 tau = np.array([tau_from_Vx(rectangles, xx, V, geom) for xx in s_eval])
             is_x_sweep = (direction == "Vx")
-        per_piece.append((rect, s, tau, is_x_sweep, perpendicular))
+        per_piece.append((rect, s, tau, is_x_sweep, perpendicular, s0_is_free, s1_is_free))
         all_abs.append(np.max(np.abs(tau)) if len(tau) else 0.0)
 
     vmax = max(max(all_abs) if all_abs else 0.0, 1e-9)
@@ -1017,7 +1049,7 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
     per_piece_annotations = []
     flow_annotations = []
 
-    for rect, s, tau, is_x_sweep, perpendicular in per_piece:
+    for rect, s, tau, is_x_sweep, perpendicular, s0_is_free, s1_is_free in per_piece:
         x0, y0, b, h = rect
         tau_abs = np.abs(tau)
         piece_max = float(tau_abs.max()) if tau_abs.size else 0.0
@@ -1043,13 +1075,14 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
             segments = [(list(s[i0:i1]) + list(s[i0:i1][::-1]),
                          list(outer_y[i0:i1]) + [base_y] * (i1 - i0))
                         for i0, i1 in _split_at_gaps(s)]
-            zp = _attachment_zero_points(s[0], s[-1], _excluded_intervals(rect, rectangles)) if perpendicular else None
+            dir_sign = (_branch_direction(s[0], s[-1], _excluded_intervals(rect, rectangles),
+                                           s0_is_free, s1_is_free, s) if perpendicular else None)
             flow_points = []
             for i in np.linspace(2, len(s) - 3, 4).astype(int):
                 if abs(tau[i]) < 1e-9:
                     continue
                 if perpendicular:
-                    dx = _branch_sign(s[i], zp) * (1.0 if tau[i] < 0 else -1.0)
+                    dx = dir_sign[i] * (1.0 if tau[i] < 0 else -1.0)
                 else:
                     dx = -1.0 if tau[i] >= 0 else 1.0
                 flow_points.append((float(s[i]), mid_y, (dx, 0.0)))
@@ -1066,13 +1099,14 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
             segments = [(list(outer_x[i0:i1]) + [base_x] * (i1 - i0),
                          list(s[i0:i1]) + list(s[i0:i1][::-1]))
                         for i0, i1 in _split_at_gaps(s)]
-            zp = _attachment_zero_points(s[0], s[-1], _excluded_intervals(rect, rectangles)) if perpendicular else None
+            dir_sign = (_branch_direction(s[0], s[-1], _excluded_intervals(rect, rectangles),
+                                           s0_is_free, s1_is_free, s) if perpendicular else None)
             flow_points = []
             for i in np.linspace(2, len(s) - 3, 4).astype(int):
                 if abs(tau[i]) < 1e-9:
                     continue
                 if perpendicular:
-                    dy = _branch_sign(s[i], zp) * (1.0 if tau[i] < 0 else -1.0)
+                    dy = dir_sign[i] * (1.0 if tau[i] < 0 else -1.0)
                 else:
                     dy = -1.0 if tau[i] >= 0 else 1.0
                 flow_points.append((mid_x, float(s[i]), (0.0, dy)))
