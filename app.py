@@ -132,6 +132,8 @@ app.layout = html.Div([
                     html.Br(),
                     "(Structural mechanics De Saint Venant's convention).",
                     html.Br(),
+                    "x0 and y0 are the coordinates of the top-right vertex of the rectangle.",
+                    html.Br(),
                     "x0, y0, base, height are in mm.",
                 ], style={"color": "gray", "fontSize": "0.85em", "marginTop": "8px"}),
             ]),
