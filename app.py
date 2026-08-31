@@ -47,6 +47,12 @@ ping_thread.start()
 
 INPUT_STYLE = {"width": "90px", "marginRight": "8px"}
 BTN_STYLE = {"marginRight": "8px", "marginTop": "6px"}
+# Minor-gridline spacing (major tick / 5, see assets/grid_snap.js) for the
+# app's default empty-canvas view (see build_geometry_figure's 300mm-span
+# empty branch, major step 50 -> minor step 10); used to seed
+# store-grid-step before the client has had a chance to report the real,
+# live value (i.e. before any zoom/pan has happened yet).
+DEFAULT_GRID_STEP = 10.0
 
 
 def _make_banner(lines, width=156):
@@ -92,6 +98,12 @@ app.layout = html.Div([
     dcc.Store(id="store-geom", data=None),
     dcc.Store(id="store-stress", data=None),
     dcc.Store(id="store-output", data=[]),
+    # [xdtick, ydtick] currently on screen for geom-graph, kept in sync by a
+    # clientside callback so the server can snap a freshly-drawn rectangle
+    # to the SAME grid the user was actually looking at (dtick changes with
+    # zoom -- see assets/grid_snap.js for the live in-drag snapping, and
+    # DEFAULT_GRID_STEP below for why this starts pre-seeded).
+    dcc.Store(id="store-grid-step", data=[DEFAULT_GRID_STEP, DEFAULT_GRID_STEP]),
 
     html.H2("Section Properties and Stress Analysis"),
 
@@ -195,16 +207,28 @@ app.layout = html.Div([
         html.Div([
             dcc.Tabs([
                 dcc.Tab(label="Section geometry", children=[
-                    dcc.Graph(id="geom-graph", config={"displaylogo": False}),
+                    html.P([
+                        "Tip: use the rectangle-draw tool ▢ in the graph toolbar above "
+                        "to sketch a rectangle directly on the plot (snaps to the grid "
+                        "lines currently on screen — zoom in for a finer grid).",
+                    ], style={"color": "gray", "fontSize": "0.8em", "margin": "4px 0"}),
+                    dcc.Graph(
+                        id="geom-graph",
+                        config={
+                            "displaylogo": False,
+                            "modeBarButtonsToAdd": ["drawrect", "eraseshape"],
+                            "scrollZoom": True,
+                        },
+                    ),
                 ]),
                 dcc.Tab(label="Normal stress map \u03c3 [MPa]", children=[
-                    dcc.Graph(id="stress-graph", config={"displaylogo": False}),
+                    dcc.Graph(id="stress-graph", config={"displaylogo": False, "scrollZoom": True}),
                 ]),
                 dcc.Tab(label="Shear stress map \u03c4 [MPa]", children=[
-                    dcc.Graph(id="shear-graph", config={"displaylogo": False}),
+                    dcc.Graph(id="shear-graph", config={"displaylogo": False, "scrollZoom": True}),
                 ]),
                 dcc.Tab(label="Torsional shear \u03c4_t [MPa]", children=[
-                    dcc.Graph(id="torsion-graph", config={"displaylogo": False}),
+                    dcc.Graph(id="torsion-graph", config={"displaylogo": False, "scrollZoom": True}),
                 ]),
             ]),
         ], style={"flex": "2", "minWidth": "500px"}),
@@ -217,6 +241,31 @@ app.layout = html.Div([
 # =====================================================================
 # CALLBACKS
 # =====================================================================
+
+# Keeps store-grid-step in sync with whatever grid spacing geom-graph is
+# actually showing right now. Uses the same niceStep() helper exposed by
+# assets/grid_snap.js (rather than Plotly's own xaxis.dtick/yaxis.dtick)
+# because Plotly only resolves those AFTER the first zoom/pan relayout --
+# they're still absent on the very first draw right after page load.
+app.clientside_callback(
+    """
+    function(relayoutData) {
+        const gd = document.getElementById("geom-graph");
+        const plot = gd ? gd.querySelector(".js-plotly-plot") : null;
+        const fl = plot && plot._fullLayout;
+        const niceStep = window.__gridSnapNiceStep;
+        if (!fl || !fl.xaxis || !fl.yaxis || !niceStep) {
+            return window.dash_clientside.no_update;
+        }
+        const xStep = niceStep(Math.abs(fl.xaxis.range[1] - fl.xaxis.range[0]));
+        const yStep = niceStep(Math.abs(fl.yaxis.range[1] - fl.yaxis.range[0]));
+        return [xStep, yStep];
+    }
+    """,
+    Output("store-grid-step", "data"),
+    Input("geom-graph", "relayoutData"),
+)
+
 
 @app.callback(
     Output("store-rects", "data"),
@@ -281,6 +330,66 @@ def confirm_add(submit_n_clicks, pending, rects):
     # keep the input fields as they are (do NOT reset to None, see note
     # in add_rectangle about the None -> 0 transition losing the value 0)
     return rects, None, None, None, no_update, no_update, no_update, no_update
+
+
+@app.callback(
+    Output("store-rects", "data", allow_duplicate=True),
+    Output("store-pending", "data", allow_duplicate=True),
+    Output("store-geom", "data", allow_duplicate=True),
+    Output("store-stress", "data", allow_duplicate=True),
+    Output("form-error", "children", allow_duplicate=True),
+    Output("confirm-overlap", "displayed", allow_duplicate=True),
+    Input("geom-graph", "relayoutData"),
+    State("store-rects", "data"),
+    State("store-grid-step", "data"),
+    prevent_initial_call=True,
+)
+def add_rectangle_from_drawing(relayout_data, rects, grid_step):
+    """Turn a rectangle sketched with the graph's draw tool into a new
+    entry, snapped to whichever grid was actually on screen at draw time
+    (grid_step, kept in sync client-side -- see the clientside callback
+    above and assets/grid_snap.js, which also live-snaps the cursor
+    itself while dragging). A browser MouseEvent's clientX/clientY are
+    only ever whole CSS pixels, so the raw coordinates that arrive here
+    carry a little sub-pixel noise even though the drag was already
+    snapped -- rounding to grid_step here is what removes that, rather
+    than a plain float-noise rounding. Plotly reports a full 'shapes'
+    array (rather than a partial 'shapes[i].x0'-style key) only right
+    after a NEW shape is added via the draw tool, which is exactly the
+    event this callback wants to react to; a longer array than the
+    current rect count is the signal that a shape was actually added (as
+    opposed to e.g. one being erased)."""
+    rects = rects or []
+    if not relayout_data or "shapes" not in relayout_data:
+        raise PreventUpdate
+
+    shapes = relayout_data["shapes"]
+    if len(shapes) <= len(rects):
+        raise PreventUpdate
+
+    new_shape = shapes[-1]
+    x0s, x1s = new_shape.get("x0"), new_shape.get("x1")
+    y0s, y1s = new_shape.get("y0"), new_shape.get("y1")
+    if None in (x0s, x1s, y0s, y1s):
+        raise PreventUpdate
+
+    x_step, y_step = grid_step or [DEFAULT_GRID_STEP, DEFAULT_GRID_STEP]
+
+    def snap(v, step):
+        return round(v / step) * step if step else v
+
+    x0, x1 = sorted([snap(x0s, x_step), snap(x1s, x_step)])
+    y0, y1 = sorted([snap(y0s, y_step), snap(y1s, y_step)])
+    b, h = x1 - x0, y1 - y0
+    if b <= 0 or h <= 0:
+        raise PreventUpdate
+
+    new_rect = [x0, y0, b, h]
+    if any(rects_overlap(tuple(new_rect), tuple(r)) for r in rects):
+        return no_update, new_rect, no_update, no_update, "", True
+
+    rects = rects + [new_rect]
+    return rects, None, None, None, "", False
 
 
 @app.callback(
