@@ -104,6 +104,15 @@ app.layout = html.Div([
     # zoom -- see assets/grid_snap.js for the live in-drag snapping, and
     # DEFAULT_GRID_STEP below for why this starts pre-seeded).
     dcc.Store(id="store-grid-step", data=[DEFAULT_GRID_STEP, DEFAULT_GRID_STEP]),
+    # Set True by assets/middle_click_pan.js for the entire duration of a
+    # middle-mouse-button drag (mousedown to mouseup), so the server-side
+    # add_rectangle_from_drawing callback can unconditionally refuse to
+    # add a rectangle while it's set -- a plain client-side revert of the
+    # drawn shape isn't reliable on its own here: a relayoutData request
+    # for the accidental shape can already be in flight to the server by
+    # the time the revert fires, so the server needs its own gate rather
+    # than trusting the client's visual state alone.
+    dcc.Store(id="store-suppress-draw", data=False),
 
     html.H2("Section Properties and Stress Analysis"),
 
@@ -169,6 +178,8 @@ app.layout = html.Div([
                     dcc.Dropdown(id="del-dropdown", options=[], placeholder="Select to delete",
                                  style={"width": "260px", "display": "inline-block"}),
                     html.Button("Delete selected", id="btn-delete", n_clicks=0,
+                                style={**BTN_STYLE, "verticalAlign": "top", "marginLeft": "8px"}),
+                    html.Button("Delete all", id="btn-delete-all", n_clicks=0,
                                 style={**BTN_STYLE, "verticalAlign": "top", "marginLeft": "8px"}),
                 ]),
             ]),
@@ -342,9 +353,10 @@ def confirm_add(submit_n_clicks, pending, rects):
     Input("geom-graph", "relayoutData"),
     State("store-rects", "data"),
     State("store-grid-step", "data"),
+    State("store-suppress-draw", "data"),
     prevent_initial_call=True,
 )
-def add_rectangle_from_drawing(relayout_data, rects, grid_step):
+def add_rectangle_from_drawing(relayout_data, rects, grid_step, suppress_draw):
     """Turn a rectangle sketched with the graph's draw tool into a new
     entry, snapped to whichever grid was actually on screen at draw time
     (grid_step, kept in sync client-side -- see the clientside callback
@@ -358,8 +370,17 @@ def add_rectangle_from_drawing(relayout_data, rects, grid_step):
     after a NEW shape is added via the draw tool, which is exactly the
     event this callback wants to react to; a longer array than the
     current rect count is the signal that a shape was actually added (as
-    opposed to e.g. one being erased)."""
+    opposed to e.g. one being erased). suppress_draw is True for the
+    whole duration of a middle-mouse-button pan drag (see
+    assets/middle_click_pan.js): Plotly's drawrect handling doesn't
+    check which button was pressed, and a client-side-only revert of an
+    accidentally-drawn shape can lose the race against this very
+    callback already being in flight to the server -- checking the flag
+    server-side is what actually closes that race, rather than trusting
+    the client's shapes array alone."""
     rects = rects or []
+    if suppress_draw:
+        raise PreventUpdate
     if not relayout_data or "shapes" not in relayout_data:
         raise PreventUpdate
 
@@ -430,6 +451,20 @@ def delete_rectangle(n_clicks, idx, rects):
         raise PreventUpdate
     rects = rects[:idx] + rects[idx + 1:]
     return rects, None, None
+
+
+@app.callback(
+    Output("store-rects", "data", allow_duplicate=True),
+    Output("store-geom", "data", allow_duplicate=True),
+    Output("store-stress", "data", allow_duplicate=True),
+    Input("btn-delete-all", "n_clicks"),
+    State("store-rects", "data"),
+    prevent_initial_call=True,
+)
+def delete_all_rectangles(n_clicks, rects):
+    if not rects:
+        raise PreventUpdate
+    return [], None, None
 
 
 @app.callback(
