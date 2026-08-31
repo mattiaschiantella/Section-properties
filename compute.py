@@ -140,81 +140,10 @@ def compute_stress_extremes(rectangles, Mx, My, N, geom):
 # cut, i.e. tau = V * S / (I * b). Vy and Vx are treated independently
 # (horizontal cuts for Vy using Ix, vertical cuts for Vx using Iy) and
 # combined as a vector magnitude when both are present. This is an
-# engineering approximation, not a rigorous 2D coupled treatment.
+# engineering approximation, not a rigorous 2D coupled treatment. See
+# _spine_profile / _perpendicular_piece_profile further down for the
+# per-rectangle, connectivity-aware implementation.
 # =====================================================================
-
-def _width_at_y(rectangles, y):
-    """Total material width at height y (sum over all rectangles whose
-    y-range contains y -- handles disjoint pieces, e.g. flanges)."""
-    w = 0.0
-    for x0, y0, b, h in rectangles:
-        if y0 <= y <= y0 + h:
-            w += b
-    return w
-
-
-def _height_at_x(rectangles, x):
-    """Total material height at position x (sum over all rectangles
-    whose x-range contains x)."""
-    h_tot = 0.0
-    for x0, y0, b, h in rectangles:
-        if x0 <= x <= x0 + b:
-            h_tot += h
-    return h_tot
-
-
-def _Sx_below(rectangles, y, y_bar):
-    """First moment about the centroidal x-axis of the part of the
-    section with y' <= y (a horizontal cut at height y)."""
-    S = 0.0
-    for x0, y0, b, h in rectangles:
-        if y <= y0:
-            continue
-        y_bottom = min(y, y0 + h)
-        hh = y_bottom - y0
-        if hh <= 0:
-            continue
-        area = b * hh
-        yc = y0 + hh / 2
-        S += area * (yc - y_bar)
-    return S
-
-
-def _Sy_left(rectangles, x, x_bar):
-    """First moment about the centroidal y-axis of the part of the
-    section with x' <= x (a vertical cut at position x)."""
-    S = 0.0
-    for x0, y0, b, h in rectangles:
-        if x <= x0:
-            continue
-        x_right = min(x, x0 + b)
-        bb = x_right - x0
-        if bb <= 0:
-            continue
-        area = bb * h
-        xc = x0 + bb / 2
-        S += area * (xc - x_bar)
-    return S
-
-
-def tau_from_Vy(rectangles, y, Vy, geom):
-    """Shear stress at height y produced by a vertical shear force Vy
-    (horizontal cut, uniform-across-width assumption)."""
-    w = _width_at_y(rectangles, y)
-    if w <= 0:
-        return 0.0
-    S = _Sx_below(rectangles, y, geom["y_bar"])
-    return Vy * S / (geom["Ix"] * w)
-
-
-def tau_from_Vx(rectangles, x, Vx, geom):
-    """Shear stress at position x produced by a horizontal shear force
-    Vx (vertical cut, uniform-across-height assumption)."""
-    h_tot = _height_at_x(rectangles, x)
-    if h_tot <= 0:
-        return 0.0
-    S = _Sy_left(rectangles, x, geom["x_bar"])
-    return Vx * S / (geom["Iy"] * h_tot)
 
 
 # =====================================================================
@@ -249,20 +178,40 @@ def _rect_shapes(rectangles, fillcolor="lightgray", opacity=0.6, line_color="bla
 
 
 def _axes_annotations(origin, angle, label_x, label_y, scale, color="black", xref="x", yref="y"):
+    """One arrow (unlabeled) plus one separate text label per axis. Kept
+    apart because an arrow-annotation's own text auto-anchors right on
+    top of the arrowhead with no control over the offset -- placing the
+    label a bit further out along the SAME (data-space) direction as the
+    arrow, instead, is what actually keeps it legible and next to the
+    tip rather than swallowed by it."""
     x0, y0 = origin
     dx = scale * np.cos(angle)
     dy = scale * np.sin(angle)
 
-    def arrow(xt, yt, text):
+    def arrow(xt, yt):
         return dict(
             x=xt, y=yt, ax=x0, ay=y0, axref=xref, ayref=yref,
             xref=xref, yref=yref,
             showarrow=True, arrowhead=2, arrowsize=1, arrowwidth=1.5,
-            arrowcolor=color, text=text, font=dict(size=12, color=color),
-            standoff=0,
+            arrowcolor=color, text="", standoff=0,
         )
 
-    return [arrow(x0 + dx, y0 + dy, label_x), arrow(x0 - dy, y0 + dx, label_y)]
+    def label(xt, yt, text):
+        return dict(
+            x=xt, y=yt, xref=xref, yref=yref, showarrow=False,
+            text=text, font=dict(size=13, color=color),
+            xanchor="center", yanchor="middle",
+        )
+
+    # label sits ~25% further out than the arrowhead, along the same
+    # (dx, dy)/(- dy, dx) direction used for the arrow itself
+    label_reach = 1.25
+    return [
+        arrow(x0 + dx, y0 + dy),
+        label(x0 + dx * label_reach, y0 + dy * label_reach, label_x),
+        arrow(x0 - dy, y0 + dx),
+        label(x0 - dy * label_reach, y0 + dx * label_reach, label_y),
+    ]
 
 
 def _infinite_line_points(point, direction, xr, yr):
@@ -458,8 +407,24 @@ def build_geometry_figure(rectangles, geom=None):
     fig = go.Figure()
 
     if not rectangles:
-        fig.update_layout(xaxis=dict(visible=False), yaxis=dict(visible=False),
-                           height=520, margin=dict(l=20, r=20, t=20, b=20))
+        # Empty canvas: still show a real, gridded, correctly-oriented
+        # coordinate system (not just a blank box) so the first rectangle
+        # can be sketched with the draw tool before any numeric input exists.
+        span = 300.0
+        xr, yr = _view_range(0, span, 0, span, margin_fraction=0.0)
+        fig.update_layout(
+            xaxis=dict(range=xr, title="x [mm]", zeroline=False,
+                       showgrid=True, gridcolor="#8c8c8c", gridwidth=1,
+                       minor=dict(showgrid=True, gridcolor="#d8d8d8")),
+            yaxis=dict(range=yr, title="y [mm]", zeroline=False,
+                       showgrid=True, gridcolor="#8c8c8c", gridwidth=1,
+                       minor=dict(showgrid=True, gridcolor="#d8d8d8"),
+                       scaleanchor="x", scaleratio=1),
+            plot_bgcolor="white",
+            height=520, margin=dict(l=50, r=30, t=30, b=50),
+            newshape=dict(line_color="crimson", line_width=2, fillcolor="rgba(220,20,60,0.15)"),
+            dragmode="drawrect",
+        )
         return fig
 
     xs = [r[0] for r in rectangles]
@@ -468,10 +433,28 @@ def build_geometry_figure(rectangles, geom=None):
     y1s = [r[1] + r[3] for r in rectangles]
     xmin, xmax = min(xs), max(x1s)
     ymin, ymax = min(ys), max(y1s)
-    axis_scale = 0.12 * max(xmax - xmin, ymax - ymin, 1.0)
+
+    # The view must always include the origin O' -- otherwise, whenever
+    # the section doesn't happen to touch (0,0) (e.g. rectangles placed
+    # with x0/y0 far from zero), the O'/x'/y' markers drawn below end up
+    # entirely outside the visible plot area.
+    view_xmin, view_xmax = min(xmin, 0), max(xmax, 0)
+    view_ymin, view_ymax = min(ymin, 0), max(ymax, 0)
+
+    # axis_scale (the little axis-arrow length) is a fraction of the
+    # actual VIEW span, not just the section's own size -- otherwise,
+    # whenever the origin sits far outside the section (view_x/ymin/max
+    # above stretch to reach it), these arrows would still be sized for
+    # the section alone and shrink to an unreadable sliver relative to
+    # the now much larger view.
+    axis_scale = 0.12 * max(view_xmax - view_xmin, view_ymax - view_ymin, 1.0)
 
     shapes = _rect_shapes(rectangles)
     annotations = _axes_annotations((0, 0), 0, "x'", "y'", axis_scale)
+    annotations.append(dict(
+        x=0, y=0, text="O'", showarrow=False, font=dict(size=13, color="black"),
+        xanchor="right", yanchor="top", xshift=-4, yshift=4,
+    ))
 
     if geom is not None:
         fig.add_trace(go.Scatter(
@@ -482,14 +465,29 @@ def build_geometry_figure(rectangles, geom=None):
         annotations += _axes_annotations(
             (geom["x_bar"], geom["y_bar"]), geom["theta_p"], "x", "y", axis_scale
         )
+        annotations.append(dict(
+            x=geom["x_bar"], y=geom["y_bar"], text="O", showarrow=False,
+            font=dict(size=13, color="red"),
+            xanchor="right", yanchor="top", xshift=-4, yshift=4,
+        ))
 
-    xr, yr = _view_range(xmin, xmax, ymin, ymax)
+    xr, yr = _view_range(view_xmin, view_xmax, view_ymin, view_ymax)
 
     fig.update_layout(
         shapes=shapes, annotations=annotations,
-        xaxis=dict(range=xr, title="x [mm]", zeroline=False),
-        yaxis=dict(range=yr, title="y [mm]", zeroline=False, scaleanchor="x", scaleratio=1),
+        xaxis=dict(range=xr, title="x [mm]", zeroline=False,
+                   showgrid=True, gridcolor="#8c8c8c", gridwidth=1,
+                   minor=dict(showgrid=True, gridcolor="#d8d8d8")),
+        yaxis=dict(range=yr, title="y [mm]", zeroline=False, scaleanchor="x", scaleratio=1,
+                   showgrid=True, gridcolor="#8c8c8c", gridwidth=1,
+                   minor=dict(showgrid=True, gridcolor="#d8d8d8")),
+        newshape=dict(line_color="crimson", line_width=2, fillcolor="rgba(220,20,60,0.15)"),
+        plot_bgcolor="white",
         margin=dict(l=50, r=30, t=30, b=50), height=520,
+        # Once the geometry has been computed, default to panning instead
+        # of drawing -- otherwise an accidental drag would sketch a new,
+        # unwanted rectangle on top of an already-finalized section.
+        dragmode="pan" if geom is not None else "drawrect",
     )
     return fig
 
@@ -649,6 +647,20 @@ def _long_axis(rect):
     return "x" if b >= h else "y"
 
 
+def _is_spine_role(rect, direction):
+    """True if `rect` plays the 'spine' role for this shear direction --
+    its own long axis matches the direction (long-axis 'y' for Vy,
+    long-axis 'x' for Vx). A spine is swept along its OWN length with a
+    genuinely varying arm (giving the classic quadratic/parabolic Q),
+    unlike a 'flange' (the opposite role), whose arm stays constant
+    along its own sweep. Which role a piece plays can flip between Vy
+    and Vx -- e.g. a horizontal flange is a flange for Vy but a spine
+    for Vx -- since it describes orientation relative to the force, not
+    a fixed structural identity."""
+    axis = _long_axis(rect)
+    return (axis == "y" and direction == "Vy") or (axis == "x" and direction == "Vx")
+
+
 def _excluded_intervals(rect, rectangles):
     """
     List of (a, b) sub-intervals along this piece's OWN long-axis span
@@ -659,6 +671,13 @@ def _excluded_intervals(rect, rectangles):
     the neighbour's zone, not to this piece's own independent length,
     so it's excluded here (from J, from the local Jourawski tent, and
     from the visualization) to avoid counting it twice.
+
+    Also reused, unchanged, when THIS piece plays the opposite ("spine")
+    role -- see _spine_profile -- to cut the same gap out of its own
+    varying-arm sweep: right where a perpendicular neighbour crosses it,
+    the thin-wall hypothesis breaks down (the corda width stops being
+    well-defined) exactly as it does on the flange side, so that
+    stretch has no business being calculated or plotted there either.
     """
     x0, y0, b, h = rect
     own_axis = _long_axis(rect)
@@ -690,31 +709,6 @@ def _excluded_intervals(rect, rectangles):
         else:
             merged.append((a, bnd))
     return merged
-
-
-def _branch_moment(entry, rectangles, arm_fn, visited):
-    """
-    Total first moment (area * arm) of `entry` plus everything
-    transitively attached to it (any rectangle touching it, or touching
-    something that touches it, and so on), excluding pieces already in
-    `visited` -- used to avoid walking back the way we came.
-
-    This lets a piece that starts its sweep NOT at a genuine free tip
-    (e.g. the web of a C-section, attached to a flange at both ends)
-    correctly account for the full static moment of everything attached
-    "before" that end, instead of starting from zero.
-    """
-    if entry in visited:
-        return 0.0
-    visited.add(entry)
-    x0, y0, b, h = entry
-    total = (b * h) * arm_fn(entry)
-    for other in rectangles:
-        if other in visited:
-            continue
-        if _rects_touch(entry, other):
-            total += _branch_moment(other, rectangles, arm_fn, visited)
-    return total
 
 
 def _end_neighbors(rect, rectangles, own_axis, end):
@@ -756,7 +750,7 @@ def _free_segments(s0, s1, excluded):
 
 def _tent_profile(s0, s1, thickness, arm_const, excluded,
                    s0_is_free=True, s1_is_free=True,
-                   q_at_s0=0.0, q_at_s1=0.0, n=40):
+                   q_at_s0=0.0, q_at_s1=0.0, gap_contributions=(), n=40):
     """
     Local first-moment profile Q(s) for a piece PERPENDICULAR to V,
     swept along its own span [s0, s1] MINUS the excluded sub-intervals
@@ -770,11 +764,21 @@ def _tent_profile(s0, s1, thickness, arm_const, excluded,
     flange-to-web joint, or two collinear pieces joined end to end).
     q_at_s0 / q_at_s1: the first moment already accumulated by
     whatever is attached at that end (0.0 if that end is free).
+    gap_contributions: (a, b, value) triples -- when the sweep crosses
+    an excluded gap spanning [a, b] (a mid-span T-junction crossing, not
+    an end connection), `value` is added to the running total there,
+    same as _spine_profile already does for its own mid-span
+    attachments. Without this, a crossing branch's own contribution
+    would simply vanish from everything downstream of it -- it isn't
+    optional bookkeeping, a branch on one side of the neutral axis can
+    have the opposite sign from one on the other side, which is exactly
+    what turns into a sign flip (opposite arrow direction) once picked up.
 
     - If s0 is not free: the sweep is anchored at s0 with q_at_s0 and
       accumulates monotonically forward all the way to s1 (through any
       interior T-junction gaps, whose local material is skipped but the
-      running total is otherwise carried straight through).
+      running total is otherwise carried straight through, picking up
+      gap_contributions as it crosses each one).
     - Else if s1 is not free: mirrored, anchored at s1.
     - Else (both ends genuinely free): classical symmetric tent --
       each free segment ramps from 0 at its own true tip(s).
@@ -788,6 +792,9 @@ def _tent_profile(s0, s1, thickness, arm_const, excluded,
 
     def _n_for(seg_start, seg_end):
         return max(int(round(n * (seg_end - seg_start) / max(s1 - s0, 1e-9))), 4)
+
+    def _gap_value(g0, g1):
+        return sum(v for a, b, v in gap_contributions if a >= g0 - 1e-6 and b <= g1 + 1e-6)
 
     all_s, all_Q = [], []
 
@@ -809,25 +816,33 @@ def _tent_profile(s0, s1, thickness, arm_const, excluded,
     elif (not s0_is_free) and s1_is_free:
         # only s1 is a genuine free tip -> anchor backward from s1 (q_at_s1 = 0)
         running = q_at_s1
+        prev_seg_start = None
         rev_s, rev_Q = [], []
         for seg_start, seg_end, _, _ in reversed(segments):
+            if prev_seg_start is not None:
+                running += _gap_value(seg_end, prev_seg_start)
             seg_s = np.linspace(seg_start, seg_end, _n_for(seg_start, seg_end))
             d = seg_end - seg_s
             rev_s.append(seg_s)
             rev_Q.append(running + thickness * d * arm_const)
             running = running + thickness * (seg_end - seg_start) * arm_const
+            prev_seg_start = seg_start
         all_s = list(reversed(rev_s))
         all_Q = list(reversed(rev_Q))
     else:
         # s0 is free (q_at_s0 = 0), OR neither end is free (q_at_s0 is the
         # actual branch moment there) -> anchor forward from s0 either way
         running = q_at_s0
+        prev_seg_end = None
         for seg_start, seg_end, _, _ in segments:
+            if prev_seg_end is not None:
+                running += _gap_value(prev_seg_end, seg_start)
             seg_s = np.linspace(seg_start, seg_end, _n_for(seg_start, seg_end))
             d = seg_s - seg_start
             all_s.append(seg_s)
             all_Q.append(running + thickness * d * arm_const)
             running = running + thickness * (seg_end - seg_start) * arm_const
+            prev_seg_end = seg_end
 
     return np.concatenate(all_s), np.concatenate(all_Q)
 
@@ -905,6 +920,254 @@ def _rects_touch(r1, r2, tol=1e-6):
     return False
 
 
+def _side_attachments(rect, rectangles):
+    """Unmerged (a, b, neighbour) triples for every PERPENDICULAR
+    neighbour touching rect's own side WITHIN its own span -- i.e. a
+    genuine mid-span T-junction, the same touching relationships
+    _excluded_intervals reports but per-neighbour and unmerged, since a
+    spine's own running total needs to add each attached branch's
+    contribution separately (two branches can overlap in position, e.g.
+    one attached on each side of a web at the same height).
+
+    Deliberately excludes a neighbour whose touching interval reaches
+    rect's own s0 or s1 -- that's not a mid-span crossing, it's a
+    CORNER (the neighbour continues collinear from rect's own tip, like
+    an L-shape), which _end_neighbors already finds and which needs the
+    neighbour's FULL total as a boundary condition (_neighbor_contribution),
+    not a fold-in partway through this piece's own material -- counting
+    it both ways would double it.
+    """
+    x0, y0, b, h = rect
+    own_axis = _long_axis(rect)
+    s0, s1 = (x0, x0 + b) if own_axis == "x" else (y0, y0 + h)
+    out = []
+    for other in rectangles:
+        if other == rect or _long_axis(other) == own_axis:
+            continue
+        ox0, oy0, ob, oh = other
+        if own_axis == "x":
+            touches = abs(oy0 + oh - y0) < 1e-6 or abs(oy0 - (y0 + h)) < 1e-6
+            a, bnd = max(x0, ox0), min(x0 + b, ox0 + ob)
+        else:
+            touches = abs(ox0 + ob - x0) < 1e-6 or abs(ox0 - (x0 + b)) < 1e-6
+            a, bnd = max(y0, oy0), min(y0 + h, oy0 + oh)
+        if touches and bnd > a and abs(a - s0) > 1e-6 and abs(bnd - s1) > 1e-6:
+            out.append((a, bnd, other))
+    return out
+
+
+def _flange_total_moment(rect, rectangles, geom, direction, exclude):
+    """Total first moment (area * constant arm) contributed by a
+    FLANGE-role piece (own long axis does NOT match `direction`, so its
+    arm stays constant along its own sweep) plus whatever continues from
+    ITS own ends -- via _neighbor_contribution, so a further connection
+    is handled correctly whichever role it plays: another flange (an
+    L/C-corner, or two collinear pieces) recurses back into this same
+    function, while a SPINE neighbour (e.g. this flange is itself
+    sandwiched between two spines, one at each end -- picture a middle
+    rung between two rails) is looked up from that spine's own varying
+    profile instead of treated as if its arm were constant. `exclude`
+    (shared with _spine_anchoring/_neighbor_contribution) is what keeps
+    this from walking back into whichever piece asked for this total in
+    the first place.
+    """
+    if rect in exclude:
+        return 0.0
+    x0, y0, b, h = rect
+    own_axis = _long_axis(rect)
+    ref = geom["y_bar"] if direction == "Vy" else geom["x_bar"]
+    arm = (y0 + h / 2 - ref) if own_axis == "x" else (x0 + b / 2 - ref)
+    total = (b * h) * arm
+
+    new_exclude = exclude | {rect}
+    for end in ("s0", "s1"):
+        for nb in _end_neighbors(rect, rectangles, own_axis, end):
+            total += _neighbor_contribution(rect, nb, rectangles, geom, direction, new_exclude)
+    return total
+
+
+def _spine_events(rect, rectangles, geom, direction):
+    """Own_axis/span/thickness/reference for `rect` as a SPINE, plus a
+    position-sorted list of (a, b, contributed_Q, neighbour) for every
+    flange-role piece attached along its own span."""
+    x0, y0, b, h = rect
+    own_axis = _long_axis(rect)
+    s0, s1 = (x0, x0 + b) if own_axis == "x" else (y0, y0 + h)
+    thickness = h if own_axis == "x" else b
+    ref = geom["y_bar"] if direction == "Vy" else geom["x_bar"]
+
+    attachments = []
+    for a, bnd, other in _side_attachments(rect, rectangles):
+        contributed = _flange_total_moment(other, rectangles, geom, direction, {rect})
+        attachments.append((a, bnd, contributed, other))
+    attachments.sort(key=lambda e: e[0])
+    return own_axis, s0, s1, thickness, ref, attachments
+
+
+def _spine_baseline_at(s0, ref, thickness, attachments, position):
+    """Cumulative Q immediately before `position` along a spine's own
+    sweep: its own smooth (quadratic, since arm = s - ref) material up
+    to the nearest attachment boundary, plus the full contribution of
+    every attachment that has fully passed by `position`. An attachment
+    straddling `position` (its own interval hasn't finished yet -- e.g.
+    two branches attached at overlapping heights on opposite sides of
+    the same spine) is treated as not-yet-counted, the same way its own
+    zone is excluded from the spine's local material integral.
+
+    Crucially, crossing an attachment's [a, bnd] also folds in THIS
+    spine's own material within that same stretch -- excluded from the
+    smooth local integral (the corda width isn't well-defined right at
+    a T-junction crossing) but still real material that has to count
+    toward the running total, or Q would never return to exactly 0 at
+    the far genuine free end (equilibrium), and two symmetric branches
+    on either side of a crossing would come out with different
+    magnitudes instead of mirroring each other. Added once per distinct
+    interval even if several attachments share it (e.g. one on each
+    side of the spine at the same position) -- not once per attachment,
+    which would double-count this spine's own material there."""
+    running = 0.0
+    cursor = s0
+    last_gap = None
+    for a, bnd, contributed, _ in attachments:
+        if a >= position:
+            break
+        seg_end = min(a, position)
+        if seg_end > cursor:
+            running += thickness * ((seg_end - ref) ** 2 - (cursor - ref) ** 2) / 2.0
+        if bnd <= position:
+            running += contributed
+            if last_gap is None or abs(a - last_gap[0]) > 1e-6 or abs(bnd - last_gap[1]) > 1e-6:
+                running += thickness * ((bnd - ref) ** 2 - (a - ref) ** 2) / 2.0
+                last_gap = (a, bnd)
+            cursor = bnd
+        else:
+            cursor = position
+            break
+    if cursor < position:
+        running += thickness * ((position - ref) ** 2 - (cursor - ref) ** 2) / 2.0
+    return running
+
+
+def _spine_anchoring(rect, rectangles, geom, direction, exclude=frozenset()):
+    """own_axis/s0/s1/thickness/ref/attachments plus s0_is_free,
+    s1_is_free, q_at_s0, q_at_s1 for `rect` as a spine -- the boundary
+    conditions shared by _spine_profile (building the sampled curve) and
+    _spine_value_at (a single-point lookup used by a neighbour asking
+    "what does this spine contribute to me"). `exclude` carries the
+    chain of pieces already visited on the way here (e.g. two collinear
+    spines end-to-end, both asking about each other) so the mutual
+    _neighbor_contribution <-> _spine_anchoring recursion terminates
+    instead of bouncing back and forth forever."""
+    own_axis, s0, s1, thickness, ref, attachments = _spine_events(rect, rectangles, geom, direction)
+    nb_s0 = _end_neighbors(rect, rectangles, own_axis, "s0")
+    nb_s1 = _end_neighbors(rect, rectangles, own_axis, "s1")
+    s0_is_free = not nb_s0
+    s1_is_free = not nb_s1
+    new_exclude = exclude | {rect}
+    q_at_s0 = sum(_neighbor_contribution(rect, nb, rectangles, geom, direction, new_exclude) for nb in nb_s0)
+    q_at_s1 = sum(_neighbor_contribution(rect, nb, rectangles, geom, direction, new_exclude) for nb in nb_s1)
+    return own_axis, s0, s1, thickness, ref, attachments, s0_is_free, s1_is_free, q_at_s0, q_at_s1
+
+
+def _spine_value_at(rect, rectangles, geom, direction, position, exclude=frozenset()):
+    """Q at a single position along rect's own spine sweep, anchored
+    exactly like _spine_profile (respecting rect's own end-to-end
+    connections, e.g. a corner into ANOTHER spine for the opposite
+    shear direction -- not just its internal mid-span attachments).
+    Used by _neighbor_contribution so a piece attaching to this spine
+    gets a boundary condition consistent with how the spine's own curve
+    is actually anchored, rather than a naive forward-from-s0 partial
+    sum that's only correct when s0 itself is the genuine free tip."""
+    own_axis, s0, s1, thickness, ref, attachments, s0_is_free, s1_is_free, q_at_s0, q_at_s1 = \
+        _spine_anchoring(rect, rectangles, geom, direction, exclude)
+    if (not s0_is_free) and s1_is_free:
+        full_total = _spine_baseline_at(s0, ref, thickness, attachments, s1)
+        forward_at_pos = _spine_baseline_at(s0, ref, thickness, attachments, position)
+        return q_at_s1 + (full_total - forward_at_pos)
+    return q_at_s0 + _spine_baseline_at(s0, ref, thickness, attachments, position)
+
+
+def _spine_profile(rect, rectangles, geom, direction, n=60):
+    """Q(s) profile for `rect` playing the SPINE role: a genuinely
+    varying arm (arm = s - ref) integrated within each free segment,
+    stepped up by each attached flange's full total the moment the
+    sweep passes it -- the quadratic/parabolic counterpart of
+    _tent_profile's linear tent for a constant-arm flange. Like
+    _tent_profile, a genuine end-to-end connection at s0 and/or s1
+    (checked the same way, via _end_neighbors -- e.g. this spine is
+    itself one of several flanges branching off ANOTHER spine, for the
+    opposite shear direction) anchors the sweep at whichever end is NOT
+    free, using that neighbour's own contribution (_neighbor_contribution)
+    as the starting baseline there, exactly mirroring _tent_profile's own
+    three-way branch. Returns (s_samples, Q_samples, thickness, is_x_sweep).
+    """
+    own_axis, s0, s1, thickness, ref, attachments, s0_is_free, s1_is_free, q_at_s0, q_at_s1 = \
+        _spine_anchoring(rect, rectangles, geom, direction)
+    is_x_sweep = (own_axis == "x")
+
+    excluded = [(a, bnd) for a, bnd, _, _ in attachments]
+    segments = _free_segments(s0, s1, excluded)
+    segments = [(a, b) for a, b, *_ in segments if b - a > 1e-9]
+    if not segments:
+        return np.array([]), np.array([]), thickness, is_x_sweep
+
+    def seg_integral(a, s):
+        return thickness * ((s - ref) ** 2 - (a - ref) ** 2) / 2.0
+
+    all_s, all_Q = [], []
+
+    if (not s0_is_free) and s1_is_free:
+        # anchor backward from s1, the only genuine free tip: Q(s) =
+        # q_at_s1 + (everything from s to s1), derived from the SAME
+        # forward baseline used below (full_total is that baseline
+        # evaluated at s1, i.e. this piece's own complete total).
+        full_total = _spine_baseline_at(s0, ref, thickness, attachments, s1)
+        for seg_start, seg_end in segments:
+            npts = max(int(round(n * (seg_end - seg_start) / max(s1 - s0, 1e-9))), 4)
+            seg_s = np.linspace(seg_start, seg_end, npts)
+            base_at_start = _spine_baseline_at(s0, ref, thickness, attachments, seg_start)
+            forward_at_s = base_at_start + seg_integral(seg_start, seg_s)
+            all_s.append(seg_s)
+            all_Q.append(q_at_s1 + (full_total - forward_at_s))
+    else:
+        # s0 free (q_at_s0 = 0), or neither end free (q_at_s0 is a
+        # genuine baseline from whatever precedes s0) -> anchor forward
+        # from s0 either way.
+        for seg_start, seg_end in segments:
+            npts = max(int(round(n * (seg_end - seg_start) / max(s1 - s0, 1e-9))), 4)
+            seg_s = np.linspace(seg_start, seg_end, npts)
+            base_at_start = q_at_s0 + _spine_baseline_at(s0, ref, thickness, attachments, seg_start)
+            all_s.append(seg_s)
+            all_Q.append(base_at_start + seg_integral(seg_start, seg_s))
+
+    return np.concatenate(all_s), np.concatenate(all_Q), thickness, is_x_sweep
+
+
+def _neighbor_contribution(rect, nb, rectangles, geom, direction, exclude=frozenset()):
+    """Contribution to `rect`'s own local Q baseline from a genuinely
+    connected neighbour `nb` at one of rect's own ends. If `nb` plays
+    the SPINE role for this direction, look up nb's own Q profile
+    (_spine_value_at, which respects nb's OWN boundary conditions --
+    e.g. nb might itself be anchored from ITS far end) exactly where
+    `rect` attaches -- never nb's siblings, and never nb's full total
+    looked up the naive way, which would double count. Otherwise `nb`
+    is itself a flange (constant arm): use its own total, recursively
+    through further flange-to-flange continuations only. `exclude`
+    (see _spine_anchoring) stops a chain of mutually-connected spines
+    from recursing into each other forever; `nb` being already in it
+    means we've looped back to somewhere already accounted for."""
+    if nb in exclude:
+        return 0.0
+    new_exclude = exclude | {rect}
+    if _is_spine_role(nb, direction):
+        nb_own_axis = _long_axis(nb)
+        x0, y0, b, h = rect
+        nx0, ny0, nb_, nh = nb
+        position = max(x0, nx0) if nb_own_axis == "x" else max(y0, ny0)
+        return _spine_value_at(nb, rectangles, geom, direction, position, new_exclude)
+    return _flange_total_moment(nb, rectangles, geom, direction, new_exclude)
+
+
 def _perpendicular_piece_profile(rect, rectangles, geom, direction):
     """
     Local linear tau(s) profile for a piece PERPENDICULAR to the given
@@ -915,14 +1178,12 @@ def _perpendicular_piece_profile(rect, rectangles, geom, direction):
     (see _branch_direction) without recomputing the neighbour lookup.
     """
     x0, y0, b, h = rect
-    excluded = _excluded_intervals(rect, rectangles)
     if direction == "Vy":
         # perpendicular to Vy means long axis = x
         own_axis = "x"
         s0, s1 = x0, x0 + b
         thickness = h
         arm_const = (y0 + h / 2) - geom["y_bar"]
-        arm_fn = lambda r: (r[1] + r[3] / 2) - geom["y_bar"]
         is_x_sweep = True
     else:
         # perpendicular to Vx means long axis = y
@@ -930,21 +1191,54 @@ def _perpendicular_piece_profile(rect, rectangles, geom, direction):
         s0, s1 = y0, y0 + h
         thickness = b
         arm_const = (x0 + b / 2) - geom["x_bar"]
-        arm_fn = lambda r: (r[0] + r[2] / 2) - geom["x_bar"]
         is_x_sweep = False
+
+    # Mid-span crossings (a perpendicular neighbour touching this piece's
+    # SIDE, not its s0/s1 tip -- see _side_attachments) need their own
+    # contribution folded into the running total right where the sweep
+    # crosses them, exactly like _spine_profile already does for its own
+    # attachments: skipping that stretch's local material (thin-wall
+    # hypothesis breaks down there) is not the same as the crossing
+    # branch contributing NOTHING -- a branch can carry either sign
+    # relative to the reference axis, so dropping it silently is what
+    # was hiding a genuine sign flip downstream of the crossing.
+    crossings = _side_attachments(rect, rectangles)
+    excluded = [(a, bnd) for a, bnd, _ in crossings]
+    gap_contributions = [
+        (a, bnd, _neighbor_contribution(rect, other, rectangles, geom, direction, {rect}))
+        for a, bnd, other in crossings
+    ]
+    # THIS piece's own material within each crossing also has to be
+    # folded in (once per distinct interval, even if several neighbours
+    # share it, e.g. one on each side at the same position) -- excluded
+    # from the local sweep for the same thin-wall reason, but it's still
+    # real material, and dropping it breaks equilibrium (Q wouldn't
+    # return to exactly 0 at the far genuine free end) and makes two
+    # otherwise-symmetric branches on either side of a crossing come out
+    # with different magnitudes instead of mirroring each other.
+    unique_gaps = []
+    for a, bnd in sorted(excluded):
+        if unique_gaps and a <= unique_gaps[-1][1] + 1e-6:
+            unique_gaps[-1] = (unique_gaps[-1][0], max(unique_gaps[-1][1], bnd))
+        else:
+            unique_gaps.append((a, bnd))
+    gap_contributions += [(a, bnd, thickness * arm_const * (bnd - a)) for a, bnd in unique_gaps]
 
     nb_s0 = _end_neighbors(rect, rectangles, own_axis, "s0")
     nb_s1 = _end_neighbors(rect, rectangles, own_axis, "s1")
     s0_is_free = not nb_s0
     s1_is_free = not nb_s1
-    # branch moment of everything attached beyond each end (0.0 if free);
-    # `{rect}` seeds `visited` so the recursion never walks back into
-    # this same piece.
-    q_at_s0 = sum(_branch_moment(nb, rectangles, arm_fn, {rect}) for nb in nb_s0)
-    q_at_s1 = sum(_branch_moment(nb, rectangles, arm_fn, {rect}) for nb in nb_s1)
+    # `{rect}` seeds the exclusion set so a flange-to-flange continuation
+    # never walks back into this same piece; a spine-role neighbour is
+    # instead looked up at the exact point it attaches (see
+    # _neighbor_contribution) rather than summed as if its arm were
+    # constant, which is what made this over-count sibling branches
+    # attached to the SAME spine before this fix.
+    q_at_s0 = sum(_neighbor_contribution(rect, nb, rectangles, geom, direction, {rect}) for nb in nb_s0)
+    q_at_s1 = sum(_neighbor_contribution(rect, nb, rectangles, geom, direction, {rect}) for nb in nb_s1)
 
     s_samples, Q = _tent_profile(s0, s1, thickness, arm_const, excluded,
-                                  s0_is_free, s1_is_free, q_at_s0, q_at_s1)
+                                  s0_is_free, s1_is_free, q_at_s0, q_at_s1, gap_contributions)
     return s_samples, Q, thickness, is_x_sweep, s0_is_free, s1_is_free
 
 
@@ -989,9 +1283,11 @@ def _split_at_gaps(s):
 def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, color, line_color):
     """
     Build one ribbon polygon PER RECTANGLE for the given shear force
-    direction ('Vy' or 'Vx'): a local linear tent for pieces
-    perpendicular to V, or the (already validated) global Jourawski
-    profile for pieces parallel to V. Each ribbon is attached directly
+    direction ('Vy' or 'Vx'): a local linear tent for a piece
+    perpendicular to V (constant arm), or a local quadratic/parabolic
+    profile for a piece parallel to V (a 'spine', varying arm) -- both
+    entirely local to that piece's own connected branch, never summing
+    in unrelated disconnected siblings. Each ribbon is attached directly
     beside its own rectangle, offset to whichever side has more room.
 
     Returns (traces, annotations, tau_max, loc_max, view_extra) where
@@ -1011,35 +1307,26 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
     per_piece = []
     for rect in rectangles:
         x0, y0, b, h = rect
-        perpendicular = (_long_axis(rect) == "x") if direction == "Vy" else (_long_axis(rect) == "y")
+        perpendicular = not _is_spine_role(rect, direction)
         s0_is_free = s1_is_free = None
         if perpendicular:
             s, Q, thickness, is_x_sweep, s0_is_free, s1_is_free = _perpendicular_piece_profile(
                 rect, rectangles, geom, direction)
-            if direction == "Vy":
-                tau = V * Q / (geom["Ix"] * thickness)
-            else:
-                tau = V * Q / (geom["Iy"] * thickness)
         else:
-            if direction == "Vy":
-                s = np.linspace(y0, y0 + h, 40)
-                # nudge the evaluation points (not the displayed range)
-                # strictly inside this piece's own thickness: sampling
-                # tau_from_Vy() exactly AT a shared boundary with another
-                # rectangle (e.g. where a flange ends and this web
-                # begins) is ambiguous for _width_at_y(), which counts
-                # BOTH pieces' widths there (ends are inclusive on both
-                # sides) -- overstating b and understating tau right at
-                # the transition.
-                eps = max(h * 1e-6, 1e-9)
-                s_eval = np.clip(s, y0 + eps, y0 + h - eps)
-                tau = np.array([tau_from_Vy(rectangles, yy, V, geom) for yy in s_eval])
-            else:
-                s = np.linspace(x0, x0 + b, 40)
-                eps = max(b * 1e-6, 1e-9)
-                s_eval = np.clip(s, x0 + eps, x0 + b - eps)
-                tau = np.array([tau_from_Vx(rectangles, xx, V, geom) for xx in s_eval])
-            is_x_sweep = (direction == "Vx")
+            # Spine role: swept along its OWN length with a genuinely
+            # varying arm (giving the classic parabola), picking up each
+            # attached flange's full contribution exactly where it
+            # attaches -- NOT the old global tau_from_Vy/Vx cut, which
+            # summed every rectangle sharing that coordinate regardless
+            # of whether they were actually connected, over-counting
+            # disconnected sibling branches (e.g. three separate flanges
+            # off the same web, overlapping in x but not touching each
+            # other) and producing a jump wherever any of them ended.
+            s, Q, thickness, is_x_sweep = _spine_profile(rect, rectangles, geom, direction)
+        if direction == "Vy":
+            tau = V * Q / (geom["Ix"] * thickness)
+        else:
+            tau = V * Q / (geom["Iy"] * thickness)
         per_piece.append((rect, s, tau, is_x_sweep, perpendicular, s0_is_free, s1_is_free))
         all_abs.append(np.max(np.abs(tau)) if len(tau) else 0.0)
 
@@ -1050,6 +1337,11 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
     flow_annotations = []
 
     for rect, s, tau, is_x_sweep, perpendicular, s0_is_free, s1_is_free in per_piece:
+        if not s.size:
+            # the piece's entire span fell inside an excluded junction
+            # zone (e.g. a very short stub entirely covered by a
+            # perpendicular neighbour) -- nothing valid to plot.
+            continue
         x0, y0, b, h = rect
         tau_abs = np.abs(tau)
         piece_max = float(tau_abs.max()) if tau_abs.size else 0.0
@@ -1075,7 +1367,7 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
             segments = [(list(s[i0:i1]) + list(s[i0:i1][::-1]),
                          list(outer_y[i0:i1]) + [base_y] * (i1 - i0))
                         for i0, i1 in _split_at_gaps(s)]
-            dir_sign = (_branch_direction(s[0], s[-1], _excluded_intervals(rect, rectangles),
+            dir_sign = (_branch_direction(s[0], s[-1], [(a, bnd) for a, bnd, _ in _side_attachments(rect, rectangles)],
                                            s0_is_free, s1_is_free, s) if perpendicular else None)
             flow_points = []
             for i in np.linspace(2, len(s) - 3, 4).astype(int):
@@ -1099,7 +1391,7 @@ def _shear_ribbons_for_direction(rectangles, geom, V, direction, section_bbox, c
             segments = [(list(outer_x[i0:i1]) + [base_x] * (i1 - i0),
                          list(s[i0:i1]) + list(s[i0:i1][::-1]))
                         for i0, i1 in _split_at_gaps(s)]
-            dir_sign = (_branch_direction(s[0], s[-1], _excluded_intervals(rect, rectangles),
+            dir_sign = (_branch_direction(s[0], s[-1], [(a, bnd) for a, bnd, _ in _side_attachments(rect, rectangles)],
                                            s0_is_free, s1_is_free, s) if perpendicular else None)
             flow_points = []
             for i in np.linspace(2, len(s) - 3, 4).astype(int):
